@@ -51,7 +51,8 @@ RARITY_COLORS = {
     "Legendary": "gold",
     "Mythic": "red",
     "Super": "rainbow",
-    "Exclusive": "lightpink"
+    "Exclusive": "lightpink",
+    "Leaderboard": "cyan" # Новая редкость для Топ-наград
 }
 
 RARITY_EMOJI = {
@@ -62,7 +63,8 @@ RARITY_EMOJI = {
     "Legendary": "🟡",
     "Mythic": "🔴",
     "Super": "🌈", 
-    "Exclusive": "🌸"
+    "Exclusive": "🌸",
+    "Leaderboard": "👑" # Эмодзи для Топ-наград
 }
 
 CLASS_EMOJI = {
@@ -78,7 +80,7 @@ CLASSES = list(CLASS_EMOJI.keys())
 active_combats = set()
 
 SHOP_PACKAGES = [
-    # id_tag, name, price, max_limit, spawn_chance
+    # id_tag, name, price (в шекелях), max_limit, spawn_chance
     ("1_rnd", "1 Случайная карта", 100, 20, 1.0),
     ("3_rnd", "3 Случайные карты", 275, 20, 0.9),
     ("5_rnd", "5 Случайных карт", 450, 20, 0.8),
@@ -86,8 +88,8 @@ SHOP_PACKAGES = [
     ("25_rnd", "25 Случайных карт", 2300, 10, 0.6),
     ("50_rnd", "50 Случайных карт", 4500, 3, 0.4),
     ("rnd_leg", "Случайная Легендарная", 1000, 5, 0.5), 
-    ("rnd_myth", "Случайная Мифическая", 10000, 3, 0.25), # Цены и шансы обновлены
-    ("rnd_sup", "Случайная Супер Карта", 75000, 1, 0.125) # Цены и шансы обновлены
+    ("rnd_myth", "Случайная Мифическая", 10000, 3, 0.25), 
+    ("rnd_sup", "Случайная Супер Карта", 75000, 1, 0.125) 
 ]
 
 # ========================================================================
@@ -145,7 +147,6 @@ async def check_and_update_schema():
         try: await db.execute("ALTER TABLE users ADD COLUMN first_name TEXT")
         except aiosqlite.OperationalError: pass
             
-        # Миграция квестов
         for col in ['q_cards_opened', 'q_rare_obtained', 'q_wins', 'q_battles', 'q_shop_buys']:
             try: await db.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
             except aiosqlite.OperationalError: pass
@@ -171,11 +172,14 @@ async def check_and_update_schema():
                 user_id INTEGER,
                 card_id INTEGER,
                 count INTEGER DEFAULT 1,
-                mutation TEXT DEFAULT 'Normal'
+                mutation TEXT DEFAULT 'Normal',
+                serial_number INTEGER DEFAULT 0
             )
         """)
         
         try: await db.execute("ALTER TABLE inventory ADD COLUMN mutation TEXT DEFAULT 'Normal'")
+        except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE inventory ADD COLUMN serial_number INTEGER DEFAULT 0")
         except aiosqlite.OperationalError: pass
         
         await db.execute("UPDATE cards SET rarity = 'Super' WHERE rarity IN ('Godly', 'Secret')")
@@ -199,11 +203,14 @@ async def check_and_update_schema():
                 luck_end REAL DEFAULT 0,
                 cd_mult REAL DEFAULT 1.0,
                 cd_end REAL DEFAULT 0,
-                last_restock REAL DEFAULT 0
+                last_restock REAL DEFAULT 0,
+                last_lb_reward REAL DEFAULT 0
             )
         """)
         
         try: await db.execute("ALTER TABLE server_settings ADD COLUMN last_restock REAL DEFAULT 0")
+        except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE server_settings ADD COLUMN last_lb_reward REAL DEFAULT 0")
         except aiosqlite.OperationalError: pass
 
         await db.execute("DROP TABLE IF EXISTS shop_items")
@@ -232,17 +239,29 @@ async def check_and_update_schema():
             )
         """)
         
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS lb_rewards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bracket TEXT,
+                reward_type TEXT,
+                amount INTEGER DEFAULT 0,
+                card_id INTEGER DEFAULT 0,
+                mutation TEXT DEFAULT 'Normal'
+            )
+        """)
+        
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SUPER_ADMIN_ID,))
         await db.execute("INSERT OR IGNORE INTO server_settings (id) VALUES (1)")
         
+        # Обновленные сложности рангов (тяжелее)
         await db.execute("DELETE FROM ranks")
         default_ranks = [
             ("Bronze I", 0, 0.8, 1.0), ("Bronze II", 50, 0.85, 1.05), ("Bronze III", 100, 0.9, 1.1), ("Bronze IV", 150, 0.95, 1.15),
             ("Silver I", 200, 1.0, 1.2), ("Silver II", 300, 1.05, 1.25), ("Silver III", 400, 1.1, 1.3), ("Silver IV", 500, 1.15, 1.35),
             ("Gold I", 650, 1.2, 1.4), ("Gold II", 800, 1.3, 1.5), ("Gold III", 950, 1.4, 1.6), ("Gold IV", 1100, 1.5, 1.7),
-            ("Platina I", 1300, 1.6, 1.8), ("Platina II", 1500, 1.7, 1.9), ("Platina III", 1700, 1.8, 2.0), ("Platina IV", 1900, 1.9, 2.1),
-            ("Diamond I", 2200, 2.1, 2.5), ("Diamond II", 2500, 2.3, 2.8), ("Diamond III", 2800, 2.5, 3.2), ("Diamond IV", 3100, 2.7, 3.6),
-            ("Diamond V", 3500, 3.0, 4.0)
+            ("Platina I", 1300, 1.8, 1.8), ("Platina II", 1500, 2.5, 1.9), ("Platina III", 1700, 3.2, 2.0), ("Platina IV", 1900, 4.0, 2.1), # Усложнено
+            ("Diamond I", 2200, 5.0, 2.5), ("Diamond II", 2500, 6.5, 2.8), ("Diamond III", 2800, 8.0, 3.2), ("Diamond IV", 3100, 10.0, 3.6),
+            ("Diamond V", 3500, 13.0, 4.0) # Сильно усложнено
         ]
         for r in default_ranks:
             await db.execute("INSERT INTO ranks (name, min_trophies, difficulty_mult, reward_mult) VALUES (?, ?, ?, ?)", r)
@@ -267,6 +286,8 @@ class EditCard(StatesGroup):
 
 class GiveCard(StatesGroup):
     user_id = State()
+    card_id = State()
+    mutation = State()
 
 class AdminBan(StatesGroup):
     user_id = State()
@@ -280,6 +301,13 @@ class AdminManage(StatesGroup):
     give_trophies_id = State()
     give_trophies_amount = State()
     
+class AdminLBRewards(StatesGroup):
+    bracket = State()
+    reward_type = State() # 'shekels' или 'card'
+    amount = State()
+    card_id = State()
+    mutation = State()
+
 class EventLuck(StatesGroup):
     mult = State()
     mins = State()
@@ -324,7 +352,7 @@ async def add_quest_progress(user_id: int, field: str, amount: int = 1):
             WHERE id = ?
         """, (user_id,))
         try:
-            await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>900 💰</b>!\nВсе квесты успешно сброшены, можете выполнять их снова!")
+            await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>900 💰 Шекелей</b>!\nВсе квесты успешно сброшены, можете выполнять их снова!")
         except: pass
 
 async def is_admin(user_id: int) -> bool:
@@ -393,6 +421,49 @@ def get_mutation_multiplier(mutation: str) -> float:
     if mutation == "Gold": return 1.1
     return 1.0
 
+def needs_serial_number(rarity: str, mutation: str) -> bool:
+    if rarity == 'Leaderboard': return True
+    if rarity in ['Mythic', 'Super']: return True
+    if rarity == 'Legendary' and mutation != 'Normal': return True
+    return False
+
+async def give_card_to_user(user_id: int, card_id: int, mutation: str, rarity: str = None) -> tuple:
+    """Возвращает (inv_id, serial_number, is_new_stack)"""
+    if not rarity:
+        card = await fetch_one("SELECT rarity FROM cards WHERE id = ?", (card_id,))
+        rarity = card['rarity'] if card else 'Basic'
+        
+    db = await get_db_connection()
+    try:
+        if needs_serial_number(rarity, mutation):
+            # Требуется уникальный серийный номер
+            res = await db.execute("SELECT MAX(serial_number) as m FROM inventory WHERE card_id = ? AND mutation = ?", (card_id, mutation))
+            row = await res.fetchone()
+            curr_max = row['m'] if (row and row['m'] is not None) else 0
+            new_serial = curr_max + 1
+            
+            cursor = await db.execute(
+                "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, 1, ?, ?)", 
+                (user_id, card_id, mutation, new_serial)
+            )
+            return cursor.lastrowid, new_serial, True
+        else:
+            # Обычное стакирование
+            res = await db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND serial_number = 0", (user_id, card_id, mutation))
+            inv_item = await res.fetchone()
+            if inv_item:
+                await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
+                return inv_item['id'], 0, False
+            else:
+                cursor = await db.execute(
+                    "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, 1, ?, 0)", 
+                    (user_id, card_id, mutation)
+                )
+                return cursor.lastrowid, 0, True
+    finally:
+        await db.commit()
+        await db.close()
+
 async def create_bordered_image(bot: Bot, photo_id: str, rarity: str) -> str:
     color = RARITY_COLORS.get(rarity, "gray")
     file = await bot.get_file(photo_id)
@@ -428,7 +499,10 @@ async def create_bordered_image(bot: Bot, photo_id: str, rarity: str) -> str:
 def format_card_name(c):
     r_em = RARITY_EMOJI.get(c['rarity'], "⚪")
     c_em = CLASS_EMOJI.get(c['class_type'], "🎯")
-    return f"{r_em} {c_em} <b>{c['name']}</b>"
+    name = f"{r_em} {c_em} <b>{c['name']}</b>"
+    if c.get('serial_number', 0) > 0:
+        name += f" <b>[#{c['serial_number']:04d}]</b>"
+    return name
 
 def format_rarity_display(rarity):
     r_em = RARITY_EMOJI.get(rarity, "⚪")
@@ -459,7 +533,7 @@ def get_pagination_keyboard(items, page, prefix, columns=2, items_per_page=8):
 # ЛОГИКА ШАНСОВ И МАГАЗИНА
 # ========================================================================
 async def calculate_chance_weights(luck_mult: float = 1.0):
-    all_cards = await fetch_all("SELECT * FROM cards")
+    all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
     if not all_cards: return [], 0
     total_weight = 0
     weights_dict = {}
@@ -496,7 +570,8 @@ async def shop_auto_restock_task():
         try:
             settings = await fetch_one("SELECT last_restock FROM server_settings WHERE id = 1")
             now = time.time()
-            if settings and (now - settings['last_restock'] >= 4 * 3600):
+            # Ресток каждые 2 часа (вместо 4)
+            if settings and (now - settings['last_restock'] >= 2 * 3600):
                 await restock_shop()
         except Exception as e:
             logging.error(f"Shop restock error: {e}")
@@ -504,30 +579,64 @@ async def shop_auto_restock_task():
 
 async def give_multiple_cards(user_id: int, count: int) -> list:
     luck_mult, _ = await get_active_events()
-    all_cards = await fetch_all("SELECT * FROM cards")
+    all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
     if not all_cards: return []
     
     weights = [c['drop_chance'] * (luck_mult if c['drop_chance'] < 15.0 else 1.0) for c in all_cards]
     won_cards = random.choices(all_cards, weights=weights, k=count)
     
     result = []
-    db = await get_db_connection()
-    try:
-        for c in won_cards:
-            mut = roll_mutation()
-            inv_item = await fetch_one("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ?", (user_id, c['id'], mut))
-            if inv_item:
-                await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
-            else:
-                await db.execute("INSERT INTO inventory (user_id, card_id, mutation) VALUES (?, ?, ?)", (user_id, c['id'], mut))
-            
-            c_copy = dict(c)
-            c_copy['mutation'] = mut
-            result.append(c_copy)
-        await db.commit()
-    finally:
-        await db.close()
+    for c in won_cards:
+        mut = roll_mutation()
+        _, serial, _ = await give_card_to_user(user_id, c['id'], mut, c['rarity'])
+        
+        c_copy = dict(c)
+        c_copy['mutation'] = mut
+        c_copy['serial_number'] = serial
+        result.append(c_copy)
     return result
+
+async def leaderboard_rewards_task():
+    while True:
+        try:
+            settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
+            now = time.time()
+            # Награды каждые 3 дня
+            if settings and (now - settings['last_lb_reward'] >= 3 * 24 * 3600):
+                top_users = await fetch_all("SELECT id, trophies, username, first_name FROM users ORDER BY trophies DESC LIMIT 20")
+                if top_users:
+                    for idx, user in enumerate(top_users):
+                        pos = idx + 1
+                        if pos == 1: bracket = "1"
+                        elif pos == 2: bracket = "2"
+                        elif pos == 3: bracket = "3"
+                        elif pos <= 9: bracket = "4_9"
+                        else: bracket = "10_20"
+                        
+                        rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ?", (bracket,))
+                        reward_msgs = []
+                        for r in rewards:
+                            if r['reward_type'] == 'shekels':
+                                await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (r['amount'], user['id']))
+                                reward_msgs.append(f"💰 {r['amount']} Шекелей")
+                            elif r['reward_type'] == 'card':
+                                c_info = await fetch_one("SELECT name, rarity FROM cards WHERE id = ?", (r['card_id'],))
+                                if c_info:
+                                    _, serial, _ = await give_card_to_user(user['id'], r['card_id'], r['mutation'], c_info['rarity'])
+                                    mut_str = "🌈" if r['mutation'] == 'Rainbow' else ("⭐" if r['mutation'] == 'Gold' else "")
+                                    s_str = f" [#{serial:04d}]" if serial > 0 else ""
+                                    reward_msgs.append(f"🃏 {mut_str} {c_info['name']}{s_str}")
+                                    
+                        if reward_msgs:
+                            msg_text = f"🏆 <b>НАГРАДА ЗА ЛИДЕРБОРД!</b>\nПоздравляем! Вы заняли <b>{pos} место</b> в топе игроков по кубкам за последние 3 дня!\n\nВаша награда:\n" + "\n".join([f"- {m}" for m in reward_msgs])
+                            try:
+                                await bot.send_message(user['id'], msg_text)
+                            except: pass
+                            
+                await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (now,))
+        except Exception as e:
+            logging.error(f"LB Rewards error: {e}")
+        await asyncio.sleep(600) # Проверяем каждые 10 минут
 
 # ========================================================================
 # ОСНОВНЫЕ КОМАНДЫ ПОЛЬЗОВАТЕЛЯ
@@ -567,7 +676,7 @@ async def cmd_profile(message: types.Message):
         f"👤 <b>Профиль игрока {name}</b>\n\n"
         f"🎖 <b>Ранг:</b> {rank['name']}\n"
         f"🏆 <b>Кубки:</b> {user['trophies']}\n"
-        f"💰 <b>Монеты:</b> {user['coins']}\n"
+        f"💰 <b>Шекели:</b> {user['coins']}\n"
         f"🃏 <b>Всего карт:</b> {total_cards['s'] or 0}\n\n"
         f"⚔️ <b>Экипировка:</b>\n"
     )
@@ -577,7 +686,7 @@ async def cmd_profile(message: types.Message):
             card = await fetch_one("SELECT name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards WHERE id = ?", (user[slot],))
             if card:
                 invs = await fetch_all("SELECT mutation FROM inventory WHERE user_id = ? AND card_id = ?", (user['id'], user[slot]))
-                muts = [i['mutation'] for i in invs]
+                muts = [item['mutation'] for item in invs]
                 mult = 1.0
                 mut_str = ""
                 if "Rainbow" in muts: mult = 1.2; mut_str = " 🌈"
@@ -608,7 +717,7 @@ async def cmd_quests(message: types.Message):
     
     text = (
         "📜 <b>ЕЖЕДНЕВНЫЕ КВЕСТЫ</b>\n"
-        "<i>Выполни все задания, чтобы получить 900 💰!</i>\n\n"
+        "<i>Выполни все задания, чтобы получить 900 💰 Шекелей!</i>\n\n"
         f"1️⃣ Открой 10 карточек: {c_op}/10 {'✅' if c_op>=10 else '❌'}\n"
         f"2️⃣ Получи редкую карточку: {r_ob}/1 {'✅' if r_ob>=1 else '❌'}\n"
         f"3️⃣ Победи в бою 3 раза: {w_win}/3 {'✅' if w_win>=3 else '❌'}\n"
@@ -641,7 +750,7 @@ async def cmd_shop(message: types.Message):
     if not items:
         return await message.answer("🛒 Магазин пока пуст. Ближайший завоз скоро!")
         
-    text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {user['coins']} монет\n<i>(Товары общие для всех. Успей купить!)</i>\n\n"
+    text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {user['coins']} шекелей\n<i>(Товары общие для всех. Успей купить!)</i>\n\n"
     
     kb = []
     for i, item in enumerate(items, 1):
@@ -659,12 +768,11 @@ async def callback_buy_shop(callback: types.CallbackQuery):
     item = await fetch_one("SELECT * FROM shop_items WHERE id = ?", (shop_id,))
     
     if not item or item['stock'] <= 0: return await callback.answer("❌ Этот товар закончился!", show_alert=True)
-    if user['coins'] < item['price']: return await callback.answer("❌ Недостаточно монет!", show_alert=True)
+    if user['coins'] < item['price']: return await callback.answer("❌ Недостаточно шекелей!", show_alert=True)
     
     await execute_db("UPDATE users SET coins = coins - ? WHERE id = ?", (item['price'], user_id))
     await execute_db("UPDATE shop_items SET stock = stock - 1 WHERE id = ?", (shop_id,))
     
-    # Квест: купи любую карточку
     await add_quest_progress(user_id, 'q_shop_buys', 1)
     
     i_type = item['item_type']
@@ -673,7 +781,6 @@ async def callback_buy_shop(callback: types.CallbackQuery):
         count = int(i_type.split("_")[0])
         won = await give_multiple_cards(user_id, count)
         
-        # Обновляем квесты на открытые карты
         await add_quest_progress(user_id, 'q_cards_opened', count)
         if any(c['rarity'] == 'Rare' for c in won):
             await add_quest_progress(user_id, 'q_rare_obtained', 1)
@@ -691,13 +798,12 @@ async def callback_buy_shop(callback: types.CallbackQuery):
         all_cards = await fetch_all("SELECT * FROM cards WHERE rarity = ?", (target_rarity,))
         if not all_cards:
             await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (item['price'], user_id))
-            return await callback.message.answer("❌ Ошибка: В базе нет карт такой редкости! Монеты возвращены.")
+            return await callback.message.answer("❌ Ошибка: В базе нет карт такой редкости! Шекели возвращены.")
             
         won_card = random.choice(all_cards)
         mut = roll_mutation()
-        inv_item = await fetch_one("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ?", (user_id, won_card['id'], mut))
-        if inv_item: await execute_db("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
-        else: await execute_db("INSERT INTO inventory (user_id, card_id, mutation) VALUES (?, ?, ?)", (user_id, won_card['id'], mut))
+        _, serial, _ = await give_card_to_user(user_id, won_card['id'], mut, won_card['rarity'])
+        won_card['serial_number'] = serial
         
         await add_quest_progress(user_id, 'q_cards_opened', 1)
         if won_card['rarity'] == 'Rare':
@@ -710,7 +816,7 @@ async def callback_buy_shop(callback: types.CallbackQuery):
     if not items:
         await callback.message.edit_text("🛒 <b>Магазин полностью распродан!</b>\nЖдите следующего завоза.")
     else:
-        text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {user['coins'] - item['price']} монет\n\n"
+        text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {user['coins'] - item['price']} шекелей\n\n"
         kb = []
         for i, itm in enumerate(items, 1):
             text += f"📦 <b>{itm['name']}</b>\n💵 Цена: <b>{itm['price']} 💰</b>\n📉 Осталось в мире: {itm['stock']} шт.\n\n"
@@ -731,7 +837,8 @@ async def cmd_getcard(message: types.Message):
     if not user: return await message.answer("Напишите /start")
     
     luck_mult, cd_mult = await get_active_events()
-    base_cooldown = 8 * 60
+    # Открытие карточек каждые 5 минут
+    base_cooldown = 5 * 60
     actual_cooldown = int(base_cooldown / cd_mult)
     
     now = time.time()
@@ -742,21 +849,18 @@ async def cmd_getcard(message: types.Message):
         mins, secs = divmod(left, 60)
         return await message.answer(f"⏳ <b>Колода перемешивается!</b>\nВозвращайся через {mins} мин. {secs} сек.")
         
-    all_cards = await fetch_all("SELECT * FROM cards")
-    if not all_cards: return await message.answer("😔 В базе пока нет карт.")
+    all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
+    if not all_cards: return await message.answer("😔 В базе пока нет доступных для выбивания карт.")
         
     weights = [c['drop_chance'] * (luck_mult if c['drop_chance'] < 15.0 else 1.0) for c in all_cards]
     won_card = random.choices(all_cards, weights=weights, k=1)[0]
     
     mutation = roll_mutation()
-    
-    inv_item = await fetch_one("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ?", (user['id'], won_card['id'], mutation))
-    if inv_item: await execute_db("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
-    else: await execute_db("INSERT INTO inventory (user_id, card_id, mutation) VALUES (?, ?, ?)", (user['id'], won_card['id'], mutation))
+    _, serial, _ = await give_card_to_user(user['id'], won_card['id'], mutation, won_card['rarity'])
+    won_card['serial_number'] = serial
         
     await execute_db("UPDATE users SET last_getcard = ? WHERE id = ?", (now, user['id']))
     
-    # Квесты: открытие карты и получение редкой
     await add_quest_progress(user['id'], 'q_cards_opened', 1)
     if won_card['rarity'] == 'Rare':
         await add_quest_progress(user['id'], 'q_rare_obtained', 1)
@@ -786,14 +890,20 @@ async def cmd_getcard(message: types.Message):
 # ========================================================================
 async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
     all_cards = await fetch_all("SELECT * FROM cards")
-    user_inv = await fetch_all("SELECT card_id FROM inventory WHERE user_id = ?", (user_id,))
+    user_inv = await fetch_all("SELECT DISTINCT card_id FROM inventory WHERE user_id = ?", (user_id,))
     user_card_ids = [item['card_id'] for item in user_inv]
     
     if not all_cards: return "Индекс пуст.", None
     
     luck_mult, _ = await get_active_events()
     weights_dict, total_w = await calculate_chance_weights(luck_mult)
-    all_cards.sort(key=lambda x: weights_dict[x['id']])
+    
+    # Сортировка: Сначала Leaderboard, затем по шансам (от редких к частым)
+    def index_sort_key(c):
+        if c['rarity'] == 'Leaderboard': return -1
+        return weights_dict.get(c['id'], 9999)
+        
+    all_cards.sort(key=index_sort_key)
     
     total_pages = max(1, math.ceil(len(all_cards) / items_per_page))
     page = max(0, min(page, total_pages - 1))
@@ -819,17 +929,19 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
         
         n_fmt = format_card_name(c)
         r_fmt = format_rarity_display(c['rarity'])
-        real_chance = (weights_dict[c['id']] / total_w) * 100 if total_w > 0 else 0
+        
+        real_chance = (weights_dict.get(c['id'], 0) / total_w) * 100 if total_w > 0 else 0
+        chance_str = f"Шанс выпадения: {real_chance:.4f}%" if c['rarity'] != 'Leaderboard' else "Выдается только за Топ!"
         
         if c['id'] in user_card_ids:
             text += f"{i}. {n_fmt}\n"
-            text += f"💎 {r_fmt} (Шанс выпадения: {real_chance:.4f}%)\n"
+            text += f"💎 {r_fmt} ({chance_str})\n"
             if c['class_type'] == 'Booster': text += f"✨ Бафф: DMG x{c['booster_dmg_mult']} // HP x{c['booster_hp_mult']}\n"
             else: text += f"⚔️ Урон: {c['damage']} // ❤️ Здоровье: {c['hp']}\n"
             text += f"🌍 Существует: {total_exists} шт.{mut_str}\n\n"
         else:
             text += f"{i}. <b>???</b> (У вас нет этой карты)\n"
-            text += f"💎 {r_fmt} (Шанс: {real_chance:.4f}%)\n"
+            text += f"💎 {r_fmt} ({chance_str})\n"
             text += f"🌍 Существует: {total_exists} шт.{mut_str}\n\n"
             
     kb = []
@@ -860,15 +972,14 @@ async def callback_index_page(callback: types.CallbackQuery):
 async def cmd_inventory(message: types.Message):
     if await check_ban(message.from_user.id): return
     inv = await fetch_all("""
-        SELECT c.id, c.name, c.rarity, c.class_type, i.count, i.mutation 
+        SELECT c.id, c.name, c.rarity, c.class_type, i.count, i.mutation, i.serial_number 
         FROM inventory i JOIN cards c ON i.card_id = c.id 
         WHERE i.user_id = ?
     """, (message.from_user.id,))
     
     if not inv: return await message.answer("🎒 Ваш инвентарь пуст. Используйте /getcard")
         
-    # Сортировка инвентаря: Сначала редкие, потом по мутациям, потом по ID
-    rarity_weight = {"Exclusive": 8, "Super": 7, "Mythic": 6, "Legendary": 5, "Epic": 4, "Rare": 3, "Uncommon": 2, "Basic": 1}
+    rarity_weight = {"Leaderboard": 9, "Exclusive": 8, "Super": 7, "Mythic": 6, "Legendary": 5, "Epic": 4, "Rare": 3, "Uncommon": 2, "Basic": 1}
     mutation_weight = {"Rainbow": 3, "Gold": 2, "Normal": 1}
     
     inv.sort(key=lambda x: (rarity_weight.get(x['rarity'], 0), mutation_weight.get(x['mutation'], 0), x['id']), reverse=True)
@@ -963,12 +1074,19 @@ async def get_team_data(user_id: int):
         if user[slot] != 0:
             card = await fetch_one("SELECT id, name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards WHERE id = ?", (user[slot],))
             if card:
-                invs = await fetch_all("SELECT mutation FROM inventory WHERE user_id = ? AND card_id = ?", (user_id, card['id']))
+                invs = await fetch_all("SELECT mutation, serial_number FROM inventory WHERE user_id = ? AND card_id = ?", (user_id, card['id']))
                 muts = [i['mutation'] for i in invs]
                 mult = 1.0
                 mut_type = "Normal"
                 if "Rainbow" in muts: mult = 1.2; mut_type = "Rainbow"
                 elif "Gold" in muts: mult = 1.1; mut_type = "Gold"
+                
+                # Добавляем инфу о серийнике для красивого вывода, если есть
+                best_serial = 0
+                for item in invs:
+                    if item['mutation'] == mut_type and item['serial_number'] > 0:
+                        best_serial = item['serial_number']
+                        break
                 
                 card['damage'] = int(card['damage'] * mult)
                 card['hp'] = int(card['hp'] * mult)
@@ -977,6 +1095,7 @@ async def get_team_data(user_id: int):
                     card['booster_hp_mult'] = round(card['booster_hp_mult'] * mult, 2)
                     
                 card['mutation'] = mut_type
+                card['serial_number'] = best_serial
                 card['max_hp'] = card['hp']
                 card['burn'] = 0     
                 card['dmg_buff'] = 0 
@@ -991,7 +1110,8 @@ async def get_bot_team(user_id: int, difficulty_mult: float):
     all_cards = await fetch_all("SELECT id, name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards")
     if len(all_cards) < 3: return []
     
-    valid_cards = [c for c in all_cards if (c['damage'] + c['hp']) <= avg_card_power * 1.8 * difficulty_mult or c['class_type'] == 'Booster']
+    # Усложнено: Увеличиваем пределы для более жестких ботов
+    valid_cards = [c for c in all_cards if (c['damage'] + c['hp']) <= avg_card_power * 2.5 * difficulty_mult or c['class_type'] == 'Booster']
     if len(valid_cards) < 3: valid_cards = all_cards
     
     team = random.sample(valid_cards, min(3, len(valid_cards)))
@@ -1003,6 +1123,7 @@ async def get_bot_team(user_id: int, difficulty_mult: float):
         c['burn'] = 0
         c['dmg_buff'] = 0
         c['mutation'] = "Normal"
+        c['serial_number'] = 0
     return team
 
 def format_combat_team_vertical(team):
@@ -1018,8 +1139,9 @@ def format_combat_team_vertical(team):
         if c.get('burn', 0) > 0: status += "🔥"
         if c.get('dmg_buff', 0) > 0: status += "✨"
         if c['class_type'] == 'Booster': status += "🔋"
+        s_str = f" [#{c['serial_number']:04d}]" if c.get('serial_number', 0) > 0 else ""
         dmg = c['damage'] + c.get('dmg_buff', 0)
-        res.append(f"• {c['name']}{status} (⚔️{dmg} | ❤️{c['hp']}/{c['max_hp']})")
+        res.append(f"• {c['name']}{s_str}{status} (⚔️{dmg} | ❤️{c['hp']}/{c['max_hp']})")
     return "\n".join(res)
 
 def build_battle_header(p1_name, t1, p2_name, t2):
@@ -1108,14 +1230,14 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log):
         
     return True
 
-async def get_dynamic_trophies(rank_name: str) -> int:
+async def get_dynamic_trophies(rank_name: str, diff_scale: float = 1.0) -> int:
     ranks = await fetch_all("SELECT name FROM ranks ORDER BY min_trophies ASC")
     rank_idx = next((i for i, r in enumerate(ranks) if r['name'] == rank_name), 0)
     base = max(1, 15 - int((rank_idx / 21) * 14)) 
     won = random.randint(max(1, base-1), base+1)
-    return won
+    return int(won * diff_scale)
 
-async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, is_pvp: bool = False):
+async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, is_pvp: bool = False):
     msg = await bot.send_message(chat_id, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!")
     await asyncio.sleep(1)
     await msg.edit_text(f"⚔️ Бой начнется через 2 сек!")
@@ -1162,7 +1284,6 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
                 await asyncio.sleep(3)
         turn += 1
 
-    # Зачисление прогресса квестов для битвы
     await add_quest_progress(p1_id, 'q_battles', 1)
     if winner == p1_name:
         await add_quest_progress(p1_id, 'q_wins', 1)
@@ -1174,7 +1295,6 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
 
     final_text = f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n\n👑 <b>Победитель: {winner}</b>\n\n"
     
-    settings = await fetch_one("SELECT * FROM server_settings WHERE id = 1")
     if is_pvp:
         if winner not in ["Ничья", "Ничья по таймауту"]:
             await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
@@ -1185,12 +1305,11 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
             rank = await get_user_rank(user['trophies'])
             
-            # УМЕНЬШЕННЫЙ ЗАРАБОТОК МОНЕТ: База берется от 15 до 60 вместо 50-200
-            coins_won = int(random.randint(15, 60) * rank['reward_mult'])
+            coins_won = int(random.randint(15, 60) * rank['reward_mult'] * diff_trophies_scale)
+            won_t = await get_dynamic_trophies(rank['name'], diff_trophies_scale)
             
-            won_t = await get_dynamic_trophies(rank['name'])
             await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
-            final_text += f"🎉 Вы получили: <b>{coins_won} 💰</b> и <b>{won_t} 🏆</b>"
+            final_text += f"🎉 Вы получили: <b>{coins_won} 💰 Шекелей</b> и <b>{won_t} 🏆</b>"
         elif winner == p2_name:
             await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
             final_text += f"💀 Вы проиграли ИИ и потеряли 2 🏆."
@@ -1200,24 +1319,56 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
     if is_pvp: active_combats.discard(p2_id)
 
 @dp.message(F.text == "⚔️ Поиск боя (боты)")
-async def cmd_pve_battle(message: types.Message):
+async def cmd_pve_select(message: types.Message):
     if await check_ban(message.from_user.id): return
     if message.from_user.id in active_combats:
         return await message.answer("❌ Вы уже находитесь в бою или в поиске!")
         
     team1 = await get_team_data(message.from_user.id)
     if not team1: return await message.answer("❌ Экипируйте карты в 🛡 Экипировка!")
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Лёгкий (-50% Кубков)", callback_data="pve_diff_easy")],
+        [InlineKeyboardButton(text="🟡 Средний (Стандарт)", callback_data="pve_diff_med")],
+        [InlineKeyboardButton(text="🔴 Сложный (+50% Кубков)", callback_data="pve_diff_hard")]
+    ])
+    await message.answer("⚔️ <b>Выберите сложность ИИ:</b>", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("pve_diff_"))
+async def cmd_pve_battle(callback: types.CallbackQuery):
+    if callback.from_user.id in active_combats:
+        return await callback.answer("❌ Вы уже в бою!", show_alert=True)
         
-    user = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
+    diff_type = callback.data.split("_")[2]
+    power_mult = 1.0
+    trophies_scale = 1.0
+    diff_name = "Средний"
+    
+    if diff_type == "easy":
+        power_mult = 0.6
+        trophies_scale = 0.5
+        diff_name = "Лёгкий"
+    elif diff_type == "hard":
+        power_mult = 1.5
+        trophies_scale = 1.5
+        diff_name = "Сложный"
+        
+    await callback.message.edit_text(f"⚔️ Ищем бота... Сложность: <b>{diff_name}</b>")
+    
+    team1 = await get_team_data(callback.from_user.id)
+    user = await fetch_one("SELECT * FROM users WHERE id = ?", (callback.from_user.id,))
     rank = await get_user_rank(user['trophies'])
     
-    team2 = await get_bot_team(message.from_user.id, rank['difficulty_mult'])
-    if not team2: return await message.answer("❌ На сервере нет карт для бота.")
+    final_diff_mult = rank['difficulty_mult'] * power_mult
+    team2 = await get_bot_team(callback.from_user.id, final_diff_mult)
+    
+    if not team2: return await callback.message.edit_text("❌ На сервере нет карт для бота.")
         
     p1_name = get_display_name(user)
-    active_combats.add(message.from_user.id)
+    active_combats.add(callback.from_user.id)
     
-    asyncio.create_task(run_battle_loop(bot, message.chat.id, message.from_user.id, p1_name, 0, f"ИИ ({rank['name']})", team1, team2, is_pvp=False))
+    asyncio.create_task(run_battle_loop(bot, callback.message.chat.id, callback.from_user.id, p1_name, 0, f"ИИ ({diff_name})", team1, team2, trophies_scale, is_pvp=False))
+    await callback.answer()
 
 # ========================================================================
 # ПАНЕЛЬ АДМИНИСТРАТОРА
@@ -1226,6 +1377,7 @@ def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🃏 Карты", callback_data="adm_cards"), InlineKeyboardButton(text="👤 Игроки", callback_data="adm_users")],
         [InlineKeyboardButton(text="🎉 Ивенты", callback_data="adm_events"), InlineKeyboardButton(text="👑 Админы", callback_data="adm_admins")],
+        [InlineKeyboardButton(text="🏆 Награды за Топ", callback_data="adm_lb_main")],
         [InlineKeyboardButton(text="📦 Бэкап Базы Данных", callback_data="adm_db")]
     ])
 
@@ -1239,7 +1391,6 @@ async def cmd_admin_panel(message: types.Message):
 async def cq_adm_main(callback: types.CallbackQuery):
     await callback.message.edit_text("⚙️ <b>Панель Администратора</b>\nВыберите раздел:", reply_markup=get_admin_main_kb())
 
-# --- АДМИНЫ ---
 @dp.callback_query(F.data == "adm_admins")
 async def cq_adm_admins(callback: types.CallbackQuery):
     if callback.from_user.id != SUPER_ADMIN_ID: return await callback.answer("Только для Супер-Админа!", show_alert=True)
@@ -1282,7 +1433,6 @@ async def cq_adm_del_msg(message: types.Message, state: FSMContext):
     except: await message.answer("❌ Должно быть числом.")
     await state.clear()
 
-# --- КАРТЫ ---
 @dp.callback_query(F.data == "adm_cards")
 async def cq_adm_cards(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1307,7 +1457,7 @@ async def add_card_photo(message: types.Message, state: FSMContext):
 @dp.message(AddCard.name)
 async def add_card_name(message: types.Message, state: FSMContext):
     await state.update_data(name=message.text)
-    await message.answer("Введи БАЗОВЫЙ ШАНС (вес, например 0.1, 5, 100):")
+    await message.answer("Введи БАЗОВЫЙ ШАНС (вес, например 0.1, 5, 100). Для Лидерборда введи 0:")
     await state.set_state(AddCard.drop_chance)
 
 @dp.message(AddCard.drop_chance)
@@ -1316,7 +1466,7 @@ async def add_card_chance(message: types.Message, state: FSMContext):
         chance = float(message.text.replace(',', '.'))
         await state.update_data(drop_chance=chance)
         kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=r)] for r in RARITY_COLORS.keys()], resize_keyboard=True)
-        await message.answer("Выбери редкость (для косметики):", reply_markup=kb)
+        await message.answer("Выбери редкость:", reply_markup=kb)
         await state.set_state(AddCard.rarity)
     except: await message.answer("❌ Должно быть число!")
 
@@ -1394,7 +1544,6 @@ async def add_card_finish(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {e}"); await state.clear()
 
-# --- РЕДАКТИРОВАНИЕ КАРТЫ С ПАГИНАЦИЕЙ ---
 @dp.callback_query(F.data == "adm_card_edit_list")
 async def adm_card_edit_start(callback: types.CallbackQuery, state: FSMContext):
     cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
@@ -1494,12 +1643,11 @@ async def adm_card_del_finish(message: types.Message, state: FSMContext):
     except: await message.answer("❌ Число.")
     await state.clear()
 
-# --- ИГРОКИ ---
 @dp.callback_query(F.data == "adm_users")
 async def cq_adm_users(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎁 Выдать карту", callback_data="adm_usr_givecard")],
-        [InlineKeyboardButton(text="💰 Выдать монеты", callback_data="adm_usr_give_coins"),
+        [InlineKeyboardButton(text="💰 Выдать шекели", callback_data="adm_usr_give_coins"),
          InlineKeyboardButton(text="🏆 Выдать кубки", callback_data="adm_usr_give_trophies")],
         [InlineKeyboardButton(text="🔄 Сбросить бой", callback_data="adm_usr_reset_battle")],
         [InlineKeyboardButton(text="🔨 Бан / Разбан", callback_data="adm_usr_ban")],
@@ -1507,10 +1655,9 @@ async def cq_adm_users(callback: types.CallbackQuery):
     ])
     await callback.message.edit_text("👤 <b>Управление Игроками</b>", reply_markup=kb)
 
-# --- НОВОЕ: ВЫДАЧА МОНЕТ ---
 @dp.callback_query(F.data == "adm_usr_give_coins")
 async def adm_usr_give_coins_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для выдачи монет:")
+    await callback.message.answer("Введите ID игрока для выдачи шекелей:")
     await state.set_state(AdminManage.give_coins_id)
     await callback.answer()
 
@@ -1519,7 +1666,7 @@ async def adm_usr_give_coins_id(message: types.Message, state: FSMContext):
     try:
         uid = int(message.text)
         await state.update_data(target_id=uid)
-        await message.answer("Сколько монет выдать?")
+        await message.answer("Сколько шекелей выдать?")
         await state.set_state(AdminManage.give_coins_amount)
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
@@ -1531,17 +1678,16 @@ async def adm_usr_give_coins_amount(message: types.Message, state: FSMContext):
         data = await state.get_data()
         uid = data['target_id']
         await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (amount, uid))
-        await log_admin(message.from_user.id, f"Выдал {amount} монет игроку {uid}")
-        await message.answer(f"✅ Успешно выдано {amount} монет игроку {uid}.")
+        await log_admin(message.from_user.id, f"Выдал {amount} шекелей игроку {uid}")
+        await message.answer(f"✅ Успешно выдано {amount} шекелей игроку {uid}.")
         try:
-            await bot.send_message(uid, f"🎁 Администратор выдал вам <b>{amount} 💰</b>!")
+            await bot.send_message(uid, f"🎁 Администратор выдал вам <b>{amount} 💰 Шекелей</b>!")
         except:
             pass
     except ValueError:
         await message.answer("❌ Сумма должна быть числом.")
     await state.clear()
 
-# --- НОВОЕ: ВЫДАЧА КУБКОВ ---
 @dp.callback_query(F.data == "adm_usr_give_trophies")
 async def adm_usr_give_trophies_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите ID игрока для выдачи кубков:")
@@ -1575,7 +1721,6 @@ async def adm_usr_give_trophies_amount(message: types.Message, state: FSMContext
         await message.answer("❌ Количество должно быть числом.")
     await state.clear()
 
-# --- НОВОЕ: СБРОС БОЯ ---
 @dp.callback_query(F.data == "adm_usr_reset_battle")
 async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите ID игрока для сброса состояния боя:")
@@ -1612,9 +1757,10 @@ async def adm_usr_give_user(message: types.Message, state: FSMContext):
         await state.update_data(give_items=items)
         kb = get_pagination_keyboard(items, 0, "give_c", columns=1, items_per_page=8)
         await message.answer("Выберите карту для выдачи:", reply_markup=kb)
+        await state.set_state(GiveCard.card_id)
     except: await message.answer("❌ ID должен быть числом.")
 
-@dp.callback_query(F.data.startswith("give_c_page_"))
+@dp.callback_query(F.data.startswith("give_c_page_"), GiveCard.card_id)
 async def adm_give_paginate(callback: types.CallbackQuery, state: FSMContext):
     page = int(callback.data.split("_")[3])
     data = await state.get_data()
@@ -1622,19 +1768,33 @@ async def adm_give_paginate(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("give_c_"))
+@dp.callback_query(F.data.startswith("give_c_"), GiveCard.card_id)
 async def adm_give_select(callback: types.CallbackQuery, state: FSMContext):
     if "page" in callback.data: return
     card_id = int(callback.data.split("_")[2])
-    user_id = (await state.get_data()).get('give_user_id')
+    await state.update_data(give_card_id=card_id)
     
-    mut = roll_mutation()
-    inv_item = await fetch_one("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ?", (user_id, card_id, mut))
-    if inv_item: await execute_db("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
-    else: await execute_db("INSERT INTO inventory (user_id, card_id, mutation) VALUES (?, ?, ?)", (user_id, card_id, mut))
-        
-    await log_admin(callback.from_user.id, f"GAVE card ID {card_id} (Mut:{mut}) to User {user_id}")
-    await callback.message.edit_text(f"✅ Карта (ID {card_id}) успешно выдана игроку {user_id}! Выпавшая мутация: {mut}")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚪ Обычная", callback_data="give_mut_Normal")],
+        [InlineKeyboardButton(text="⭐ Золотая", callback_data="give_mut_Gold")],
+        [InlineKeyboardButton(text="🌈 Радужная", callback_data="give_mut_Rainbow")]
+    ])
+    await callback.message.edit_text("Выберите мутацию для карты:", reply_markup=kb)
+    await state.set_state(GiveCard.mutation)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("give_mut_"), GiveCard.mutation)
+async def adm_give_mut_select(callback: types.CallbackQuery, state: FSMContext):
+    mutation = callback.data.split("_")[2]
+    data = await state.get_data()
+    user_id = data.get('give_user_id')
+    card_id = data.get('give_card_id')
+    
+    _, serial, _ = await give_card_to_user(user_id, card_id, mutation)
+    
+    s_str = f" [#{serial:04d}]" if serial > 0 else ""
+    await log_admin(callback.fromuser_id, f"GAVE card ID {card_id} (Mut:{mutation}) to User {user_id}")
+    await callback.message.edit_text(f"✅ Карта (ID {card_id}) успешно выдана игроку {user_id}!\nМутация: {mutation}{s_str}")
     await state.clear()
     await callback.answer()
 
@@ -1657,7 +1817,118 @@ async def adm_usr_ban_finish(message: types.Message, state: FSMContext):
     except: pass
     await state.clear()
 
-# --- ИВЕНТЫ И РАССЫЛКА ---
+@dp.callback_query(F.data == "adm_lb_main")
+async def adm_lb_main(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥇 1 Место", callback_data="lb_edit_1")],
+        [InlineKeyboardButton(text="🥈 2 Место", callback_data="lb_edit_2")],
+        [InlineKeyboardButton(text="🥉 3 Место", callback_data="lb_edit_3")],
+        [InlineKeyboardButton(text="🏅 4-9 Места", callback_data="lb_edit_4_9")],
+        [InlineKeyboardButton(text="🎖 10-20 Места", callback_data="lb_edit_10_20")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
+    ])
+    await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите позицию для редактирования наград (выдаются каждые 3 дня):", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lb_edit_"))
+async def adm_lb_edit(callback: types.CallbackQuery, state: FSMContext):
+    bracket = callback.data.replace("lb_edit_", "")
+    rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ?", (bracket,))
+    
+    text = f"🏆 <b>Награды для места: {bracket.replace('_', '-')}</b>\n\n"
+    if not rewards:
+        text += "<i>Награды не установлены.</i>\n"
+    else:
+        for r in rewards:
+            if r['reward_type'] == 'shekels':
+                text += f"💰 {r['amount']} Шекелей\n"
+            elif r['reward_type'] == 'card':
+                c = await fetch_one("SELECT name FROM cards WHERE id = ?", (r['card_id'],))
+                n = c['name'] if c else "Удаленная карта"
+                mut = "🌈" if r['mutation'] == 'Rainbow' else ("⭐" if r['mutation'] == 'Gold' else "")
+                text += f"🃏 {mut} {n} (ID: {r['card_id']})\n"
+                
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить Шекели", callback_data=f"lb_add_sh_{bracket}")],
+        [InlineKeyboardButton(text="➕ Добавить Карту", callback_data=f"lb_add_cd_{bracket}")],
+        [InlineKeyboardButton(text="🗑 Очистить награды", callback_data=f"lb_clear_{bracket}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_lb_main")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("lb_clear_"))
+async def adm_lb_clear(callback: types.CallbackQuery):
+    bracket = callback.data.replace("lb_clear_", "")
+    await execute_db("DELETE FROM lb_rewards WHERE bracket = ?", (bracket,))
+    await callback.answer("✅ Награды очищены!", show_alert=True)
+    await adm_lb_edit(callback, None) # Переотрисовываем меню
+
+@dp.callback_query(F.data.startswith("lb_add_sh_"))
+async def adm_lb_add_shekels(callback: types.CallbackQuery, state: FSMContext):
+    bracket = callback.data.replace("lb_add_sh_", "")
+    await state.update_data(lb_bracket=bracket, lb_reward_type="shekels")
+    await callback.message.answer("Введите количество Шекелей для выдачи:")
+    await state.set_state(AdminLBRewards.amount)
+    await callback.answer()
+
+@dp.message(AdminLBRewards.amount)
+async def adm_lb_save_shekels(message: types.Message, state: FSMContext):
+    try:
+        amt = int(message.text)
+        data = await state.get_data()
+        await execute_db("INSERT INTO lb_rewards (bracket, reward_type, amount) VALUES (?, ?, ?)", (data['lb_bracket'], 'shekels', amt))
+        await message.answer(f"✅ Награда {amt} шекелей добавлена для {data['lb_bracket']} места!")
+    except: await message.answer("❌ Число!")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("lb_add_cd_"))
+async def adm_lb_add_card(callback: types.CallbackQuery, state: FSMContext):
+    bracket = callback.data.replace("lb_add_cd_", "")
+    await state.update_data(lb_bracket=bracket, lb_reward_type="card")
+    
+    all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '')} {c['name']} (ID:{c['id']})"} for c in all_cards]
+    await state.update_data(lb_items=items)
+    kb = get_pagination_keyboard(items, 0, "lbc", columns=1, items_per_page=8)
+    
+    await callback.message.edit_text("Выберите карту для награды:", reply_markup=kb)
+    await state.set_state(AdminLBRewards.card_id)
+
+@dp.callback_query(F.data.startswith("lbc_page_"), AdminLBRewards.card_id)
+async def adm_lb_c_paginate(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[2])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('lb_items', []), page, "lbc", columns=1, items_per_page=8)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("lbc_"), AdminLBRewards.card_id)
+async def adm_lb_c_select(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[1])
+    await state.update_data(lb_card_id=card_id)
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚪ Обычная", callback_data="lb_mut_Normal")],
+        [InlineKeyboardButton(text="⭐ Золотая", callback_data="lb_mut_Gold")],
+        [InlineKeyboardButton(text="🌈 Радужная", callback_data="lb_mut_Rainbow")]
+    ])
+    await callback.message.edit_text("Выберите мутацию для этой награды:", reply_markup=kb)
+    await state.set_state(AdminLBRewards.mutation)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("lb_mut_"), AdminLBRewards.mutation)
+async def adm_lb_mut_select(callback: types.CallbackQuery, state: FSMContext):
+    mutation = callback.data.split("_")[2]
+    data = await state.get_data()
+    bracket = data['lb_bracket']
+    card_id = data['lb_card_id']
+    
+    await execute_db("INSERT INTO lb_rewards (bracket, reward_type, card_id, mutation) VALUES (?, ?, ?, ?)", (bracket, 'card', card_id, mutation))
+    
+    await callback.message.edit_text(f"✅ Карта (ID {card_id}, Мутация: {mutation}) добавлена в награды для {bracket} места!")
+    await state.clear()
+    await callback.answer()
+
 @dp.callback_query(F.data == "adm_events")
 async def cq_adm_events(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -1744,7 +2015,6 @@ async def cmd_admin_restock(message: types.Message):
     await restock_shop()
     await message.answer("✅ Ассортимент глобального магазина принудительно обновлен! Рассылка запущена.")
 
-# --- БЭКАПЫ БД ---
 @dp.callback_query(F.data == "adm_db")
 async def adm_db_func(callback: types.CallbackQuery):
     file = FSInputFile(DB_NAME)
@@ -1767,11 +2037,16 @@ async def process_bd_upload(message: types.Message):
 async def main():
     await check_and_update_schema()
     
-    # Инициализация первого магазина
     shop_exists = await fetch_all("SELECT * FROM shop_items")
     if not shop_exists: await restock_shop()
     
+    # Инициализация времени выдачи наград, если оно 0 (первый запуск)
+    settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
+    if settings and settings['last_lb_reward'] == 0:
+        await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (time.time(),))
+    
     asyncio.create_task(shop_auto_restock_task())
+    asyncio.create_task(leaderboard_rewards_task())
     
     commands = [
         BotCommand(command="start", description="Главное меню"),
@@ -1786,7 +2061,7 @@ async def main():
     ]
     await bot.set_my_commands(commands)
     
-    logging.info("🤖 Карточный бот запущен (Ultimate Version)!")
+    logging.info("🤖 Карточный бот запущен (Полная Версия с Лидербордом и Серийниками)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
