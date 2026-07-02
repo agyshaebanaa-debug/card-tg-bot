@@ -79,19 +79,19 @@ CLASS_EMOJI = {
 CLASSES = list(CLASS_EMOJI.keys())
 
 active_combats = set()
-active_trades_users = set()  # Хранит ID пользователей, занятых трейдом
-active_trades = {}  # Хранит структуры активных трейдов
 
+# Обновленные шансы в магазине и новый пак на 100 карт
 SHOP_PACKAGES = [
     ("1_rnd", "1 Случайная карта", 100, 20, 1.0),
-    ("3_rnd", "3 Случайные карты", 275, 20, 0.9),
-    ("5_rnd", "5 Случайных карт", 450, 20, 0.8),
-    ("10_rnd", "10 Случайных карт", 900, 15, 0.7),
-    ("25_rnd", "25 Случайных карт", 2300, 10, 0.6),
-    ("50_rnd", "50 Случайных карт", 4500, 3, 0.4),
-    ("rnd_leg", "Случайная Легендарная", 1000, 5, 0.5), 
-    ("rnd_myth", "Случайная Мифическая", 10000, 3, 0.25), 
-    ("rnd_sup", "Случайная Супер Карта", 75000, 1, 0.125) 
+    ("3_rnd", "3 Случайные карты", 275, 20, 1.0),
+    ("5_rnd", "5 Случайных карт", 450, 20, 0.9),
+    ("10_rnd", "10 Случайных карт", 900, 15, 0.8),
+    ("25_rnd", "25 Случайных карт", 2300, 10, 0.7),
+    ("50_rnd", "50 Случайных карт", 4500, 3, 0.6),
+    ("100_rnd", "100 Случайных карт", 9000, 2, 0.4),
+    ("rnd_leg", "Случайная Легендарная", 1000, 5, 0.7), 
+    ("rnd_myth", "Случайная Мифическая", 10000, 3, 0.4), 
+    ("rnd_sup", "Случайная Супер Карта", 75000, 1, 0.2) 
 ]
 
 # ========================================================================
@@ -142,7 +142,10 @@ async def check_and_update_schema():
                 last_getcard REAL DEFAULT 0,
                 equip1 INTEGER DEFAULT 0,
                 equip2 INTEGER DEFAULT 0,
-                equip3 INTEGER DEFAULT 0
+                equip3 INTEGER DEFAULT 0,
+                quests_cooldown REAL DEFAULT 0,
+                pity_mythic INTEGER DEFAULT 0,
+                pity_super INTEGER DEFAULT 0
             )
         """)
         
@@ -152,6 +155,15 @@ async def check_and_update_schema():
         for col in ['q_cards_opened', 'q_rare_obtained', 'q_wins', 'q_battles', 'q_shop_buys']:
             try: await db.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
             except aiosqlite.OperationalError: pass
+            
+        try: await db.execute("ALTER TABLE users ADD COLUMN quests_cooldown REAL DEFAULT 0")
+        except aiosqlite.OperationalError: pass
+        
+        try: await db.execute("ALTER TABLE users ADD COLUMN pity_mythic INTEGER DEFAULT 0")
+        except aiosqlite.OperationalError: pass
+        
+        try: await db.execute("ALTER TABLE users ADD COLUMN pity_super INTEGER DEFAULT 0")
+        except aiosqlite.OperationalError: pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cards (
@@ -186,7 +198,6 @@ async def check_and_update_schema():
         
         await db.execute("UPDATE cards SET rarity = 'Super' WHERE rarity IN ('Godly', 'Secret')")
         
-        # Обновление и чистка рангов
         await db.execute("DROP TABLE IF EXISTS ranks")
         await db.execute("""
             CREATE TABLE ranks (
@@ -256,7 +267,6 @@ async def check_and_update_schema():
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SUPER_ADMIN_ID,))
         await db.execute("INSERT OR IGNORE INTO server_settings (id) VALUES (1)")
         
-        # Заполнение новой таблицы рангов (Diamond V убран, добавлены Ruby I-V)
         async with db.execute("SELECT COUNT(*) as c FROM ranks") as cursor:
             row = await cursor.fetchone()
             if row and row['c'] == 0:
@@ -324,9 +334,6 @@ class EventCD(StatesGroup):
 class AdminAnnounce(StatesGroup):
     content = State()
 
-class TradeState(StatesGroup):
-    waiting_target = State()
-
 class PvPState(StatesGroup):
     waiting_target = State()
 
@@ -341,10 +348,13 @@ def get_display_name(user_data: dict) -> str:
 async def add_quest_progress(user_id: int, field: str, amount: int = 1):
     if field not in ['q_cards_opened', 'q_rare_obtained', 'q_wins', 'q_battles', 'q_shop_buys']:
         return
-    await execute_db(f"UPDATE users SET {field} = {field} + ? WHERE id = ?", (amount, user_id))
-    
+        
     user = await fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
-    if not user: return
+    if not user or user['quests_cooldown'] > time.time():
+        return
+        
+    await execute_db(f"UPDATE users SET {field} = {field} + ? WHERE id = ?", (amount, user_id))
+    user = await fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
     
     if (user['q_cards_opened'] >= 10 and
         user['q_rare_obtained'] >= 1 and
@@ -354,16 +364,17 @@ async def add_quest_progress(user_id: int, field: str, amount: int = 1):
         
         await execute_db("""
             UPDATE users SET
-                coins = coins + 1500,
+                coins = coins + 900,
                 q_cards_opened = 0,
                 q_rare_obtained = 0,
                 q_wins = 0,
                 q_battles = 0,
-                q_shop_buys = 0
+                q_shop_buys = 0,
+                quests_cooldown = ?
             WHERE id = ?
-        """, (user_id,))
+        """, (time.time() + 3600, user_id))
         try:
-            await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>1500 💰 Шекелей</b>!\nВсе квесты успешно сброшены, можете выполнять их снова!")
+            await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>900 💰 Шекелей</b>!\nВозвращайтесь через 1 час за новыми заданиями!")
         except: pass
 
 async def is_admin(user_id: int) -> bool:
@@ -401,9 +412,8 @@ def get_main_keyboard(is_adm: bool = False):
         [KeyboardButton(text="🎴 Выбить карту"), KeyboardButton(text="⚔️ Поиск боя (боты)")],
         [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="🛡 Экипировка")],
         [KeyboardButton(text="🛒 Магазин"), KeyboardButton(text="📜 Квесты")],
-        [KeyboardButton(text="🤝 Трейды"), KeyboardButton(text="⚔️ PvP Дуэль")],
-        [KeyboardButton(text="🏆 Топ игроков"), KeyboardButton(text="👤 Профиль")],
-        [KeyboardButton(text="📖 Индекс")]
+        [KeyboardButton(text="⚔️ PvP Дуэль"), KeyboardButton(text="🏆 Топ игроков")],
+        [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📖 Индекс")]
     ]
     if is_adm: kb.append([KeyboardButton(text="⚙️ Админ-панель")])
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
@@ -445,6 +455,17 @@ async def give_card_to_user(user_id: int, card_id: int, mutation: str, rarity: s
         
     db = await get_db_connection()
     try:
+        # Супер Админ не расходует глобальные серийники и не триггерит экзисты
+        if user_id == SUPER_ADMIN_ID:
+            res = await db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND serial_number = -1", (user_id, card_id, mutation))
+            inv_item = await res.fetchone()
+            if inv_item:
+                await db.execute("UPDATE inventory SET count = count + 1 WHERE id = ?", (inv_item['id'],))
+                return inv_item['id'], -1, False
+            else:
+                cursor = await db.execute("INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, 1, ?, -1)", (user_id, card_id, mutation))
+                return cursor.lastrowid, -1, True
+
         if needs_serial_number(rarity, mutation):
             res = await db.execute("SELECT MAX(serial_number) as m FROM inventory WHERE card_id = ? AND mutation = ?", (card_id, mutation))
             row = await res.fetchone()
@@ -538,7 +559,7 @@ def get_pagination_keyboard(items, page, prefix, columns=2, items_per_page=8):
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # ========================================================================
-# ЛОГИКА ШАНСОВ И МАГАЗИНА
+# ЛОГИКА ШАНСОВ И МАГАЗИНА И PITY
 # ========================================================================
 async def calculate_chance_weights(luck_mult: float = 1.0):
     all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
@@ -578,7 +599,8 @@ async def shop_auto_restock_task():
         try:
             settings = await fetch_one("SELECT last_restock FROM server_settings WHERE id = 1")
             now = time.time()
-            if settings and (now - settings['last_restock'] >= 2 * 3600):
+            # Ресток магазина каждые 90 минут (1.5 часа)
+            if settings and (now - settings['last_restock'] >= 1.5 * 3600):
                 await restock_shop()
         except Exception as e:
             logging.error(f"Shop restock error: {e}")
@@ -586,29 +608,57 @@ async def shop_auto_restock_task():
 
 async def give_multiple_cards(user_id: int, count: int) -> list:
     luck_mult, _ = await get_active_events()
+    user = await fetch_one("SELECT pity_mythic, pity_super FROM users WHERE id=?", (user_id,))
+    pm = user['pity_mythic']
+    ps = user['pity_super']
+
     all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
     if not all_cards: return []
     
+    super_cards = [c for c in all_cards if c['rarity'] == 'Super']
+    mythic_cards = [c for c in all_cards if c['rarity'] == 'Mythic']
     weights = [c['drop_chance'] * (luck_mult if c['drop_chance'] < 15.0 else 1.0) for c in all_cards]
-    won_cards = random.choices(all_cards, weights=weights, k=count)
     
-    result = []
-    for c in won_cards:
+    results = []
+    for _ in range(count):
+        card = random.choices(all_cards, weights=weights, k=1)[0]
+        is_pity = False
+        p_type = None
+
+        if ps + 1 >= 10000 and card['rarity'] != 'Super' and super_cards:
+            card = random.choice(super_cards)
+            is_pity = True
+            p_type = 'Super'
+        elif pm + 1 >= 1000 and card['rarity'] not in ['Mythic', 'Super'] and mythic_cards:
+            card = random.choice(mythic_cards)
+            is_pity = True
+            p_type = 'Mythic'
+
+        if card['rarity'] == 'Super': 
+            ps = 0; pm += 1
+        elif card['rarity'] == 'Mythic': 
+            pm = 0; ps += 1
+        else: 
+            ps += 1; pm += 1
+
         mut = roll_mutation()
-        _, serial, _ = await give_card_to_user(user_id, c['id'], mut, c['rarity'])
-        
-        c_copy = dict(c)
+        _, serial, _ = await give_card_to_user(user_id, card['id'], mut, card['rarity'])
+
+        c_copy = dict(card)
         c_copy['mutation'] = mut
         c_copy['serial_number'] = serial
-        result.append(c_copy)
-    return result
+        c_copy['is_pity'] = is_pity
+        c_copy['pity_type'] = p_type
+        results.append(c_copy)
+
+    await execute_db("UPDATE users SET pity_mythic=?, pity_super=? WHERE id=?", (pm, ps, user_id))
+    return results
 
 async def leaderboard_rewards_task():
     while True:
         try:
             settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
             now = time.time()
-            # Изменено на 2 дня вместо 3 дней
             if settings and (now - settings['last_lb_reward'] >= 2 * 24 * 3600):
                 top_users = await fetch_all("SELECT id, trophies, username, first_name FROM users ORDER BY trophies DESC LIMIT 20")
                 if top_users:
@@ -665,28 +715,12 @@ async def cmd_start(message: types.Message):
         (message.from_user.username, message.from_user.first_name, message.from_user.id)
     )
     
-    # Механизм самовосстановления: принудительный сброс зависшего трейда при команде /start
     active_combats.discard(message.from_user.id)
-    active_trades_users.discard(message.from_user.id)
-    
-    # Ищем и очищаем поврежденные сессии трейда с участием этого игрока
-    broken_trades = []
-    for t_id, t_data in active_trades.items():
-        if t_data['p1'] == message.from_user.id or t_data['p2'] == message.from_user.id:
-            broken_trades.append(t_id)
-            other_p = t_data['p2'] if t_data['p1'] == message.from_user.id else t_data['p1']
-            active_trades_users.discard(other_p)
-            try:
-                await bot.send_message(other_p, "⚠️ Трейд был отменен, так как ваш напарник перезапустил бота.")
-            except:
-                pass
-    for t_id in broken_trades:
-        active_trades.pop(t_id, None)
 
     adm = await is_admin(message.from_user.id)
     await message.answer(
         "👋 <b>Добро пожаловать в Card Battle Bot!</b>\n\n"
-        "Собери свою колоду уникальных юнитов, выставляй их в бой, поднимай кубки и обменивайся картами с другими игроками!\n\n"
+        "Собери свою колоду уникальных юнитов, выставляй их в бой и поднимай кубки!\n\n"
         "Используй меню снизу для навигации.",
         reply_markup=get_main_keyboard(adm)
     )
@@ -708,6 +742,8 @@ async def cmd_profile(message: types.Message):
         f"🏆 <b>Кубки:</b> {user['trophies']}\n"
         f"💰 <b>Шекели:</b> {user['coins']}\n"
         f"🃏 <b>Всего карт:</b> {total_cards['s'] or 0}\n\n"
+        f"🔮 <b>Pity (Гарант на Мифик):</b> {user['pity_mythic']}/1000\n"
+        f"🌠 <b>Pity (Гарант на Супер):</b> {user['pity_super']}/10000\n\n"
         f"⚔️ <b>Экипировка:</b>\n"
     )
     
@@ -739,6 +775,12 @@ async def cmd_quests(message: types.Message):
     user = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
     if not user: return await message.answer("Напишите /start")
     
+    now = time.time()
+    if user['quests_cooldown'] > now:
+        left = int(user['quests_cooldown'] - now)
+        m, s = divmod(left, 60)
+        return await message.answer(f"⏳ <b>Квесты выполнены!</b>\nНовые задания появятся через {m} мин. {s} сек.")
+    
     c_op = min(10, user['q_cards_opened'])
     r_ob = min(1, user['q_rare_obtained'])
     w_win = min(3, user['q_wins'])
@@ -747,7 +789,7 @@ async def cmd_quests(message: types.Message):
     
     text = (
         "📜 <b>ЕЖЕДНЕВНЫЕ КВЕСТЫ</b>\n"
-        "<i>Выполни все задания, чтобы получить 1500 💰 Шекелей!</i>\n\n"
+        "<i>Выполни все задания, чтобы получить 900 💰 Шекелей!</i>\n\n"
         f"1️⃣ Открой 10 карточек: {c_op}/10 {'✅' if c_op>=10 else '❌'}\n"
         f"2️⃣ Получи редкую карточку: {r_ob}/1 {'✅' if r_ob>=1 else '❌'}\n"
         f"3️⃣ Победи в бою 3 раза: {w_win}/3 {'✅' if w_win>=3 else '❌'}\n"
@@ -768,7 +810,6 @@ async def cmd_top(message: types.Message):
         rank = await get_user_rank(u['trophies'])
         text += f"{i}. {name} — <b>{u['trophies']} 🏆</b> ({rank['name']})\n"
         
-    # Изменено на 2 дня вместо 3 дней
     text += "\n🎁 <b>Награды за Топ (выдаются каждые 2 дня):</b>\n"
     brackets = ["1", "2", "3", "4_9", "10_20"]
     bracket_names = {"1": "🥇 1 место", "2": "🥈 2 место", "3": "🥉 3 место", "4_9": "🏅 4-9 места", "10_20": "🎖 10-20 места"}
@@ -817,7 +858,7 @@ async def callback_buy_shop(callback: types.CallbackQuery):
     shop_id = int(callback.data.split("_")[2])
     user_id = callback.from_user.id
     
-    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (user_id,))
+    user = await fetch_one("SELECT coins, pity_mythic, pity_super FROM users WHERE id = ?", (user_id,))
     item = await fetch_one("SELECT * FROM shop_items WHERE id = ?", (shop_id,))
     
     if not item or item['stock'] <= 0: return await callback.answer("❌ Этот товар закончился!", show_alert=True)
@@ -838,10 +879,19 @@ async def callback_buy_shop(callback: types.CallbackQuery):
         if any(c['rarity'] == 'Rare' for c in won):
             await add_quest_progress(user_id, 'q_rare_obtained', 1)
             
+        pity_pulls = [c for c in won if c.get('is_pity')]
+        
         if count == 1: 
             mut_str = "🌈 " if won[0]['mutation'] == 'Rainbow' else ("⭐ " if won[0]['mutation'] == 'Gold' else "")
             msg = f"🛍 <b>Покупка успешна!</b>\nВы выбили: {mut_str}{format_card_name(won[0])}"
-        else: msg = f"🛍 <b>Успешно! Вы открыли пак из {count} карт!</b>\nПосмотрите новинки в 🎒 Инвентаре."
+            if won[0].get('is_pity'):
+                msg = f"🌟 <b>ЖАЛОСТЬ СРАБОТАЛА! Гарантированный {won[0]['pity_type']}!</b> 🌟\n\n" + msg
+        else: 
+            msg = f"🛍 <b>Успешно! Вы открыли пак из {count} карт!</b>\nПосмотрите новинки в 🎒 Инвентаре."
+            if pity_pulls:
+                p_names = ", ".join([f"{c['name']} (Pity {c['pity_type']})" for c in pity_pulls])
+                msg += f"\n\n🌟 <b>Сработала ЖАЛОСТЬ! Получены гарантированные карты:</b>\n{p_names}!"
+                
         await callback.message.answer(msg)
         
     elif i_type.startswith("rnd_"):
@@ -861,6 +911,14 @@ async def callback_buy_shop(callback: types.CallbackQuery):
         await add_quest_progress(user_id, 'q_cards_opened', 1)
         if won_card['rarity'] == 'Rare':
             await add_quest_progress(user_id, 'q_rare_obtained', 1)
+            
+        # Pity logic for guaranteed shop packs
+        pm = user['pity_mythic']
+        ps = user['pity_super']
+        if target_rarity == 'Super': ps = 0; pm += 1
+        elif target_rarity == 'Mythic': pm = 0; ps += 1
+        else: ps += 1; pm += 1
+        await execute_db("UPDATE users SET pity_mythic=?, pity_super=? WHERE id=?", (pm, ps, user_id))
         
         mut_str = "🌈 Радужная" if mut == 'Rainbow' else ("⭐ Золотая" if mut == 'Gold' else "Обычная")
         await callback.message.answer(f"🛍 <b>Покупка успешна!</b>\nГарантированная редкость {target_rarity}!\nВы выбили: {format_card_name(won_card)}\nМутация: {mut_str}")
@@ -869,7 +927,8 @@ async def callback_buy_shop(callback: types.CallbackQuery):
     if not items:
         await callback.message.edit_text("🛒 <b>Магазин полностью распродан!</b>\nЖдите следующего завоза.")
     else:
-        text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {user['coins'] - item['price']} шекелей\n\n"
+        new_coins = user['coins'] - item['price']
+        text = f"🛒 <b>Глобальный Магазин</b>\n💰 Твой баланс: {new_coins} шекелей\n\n"
         kb = []
         for i, itm in enumerate(items, 1):
             text += f"📦 <b>{itm['name']}</b>\n💵 Цена: <b>{itm['price']} 💰</b>\n📉 Осталось в мире: {itm['stock']} шт.\n\n"
@@ -890,7 +949,8 @@ async def cmd_getcard(message: types.Message):
     if not user: return await message.answer("Напишите /start")
     
     luck_mult, cd_mult = await get_active_events()
-    base_cooldown = 5 * 60
+    # Изменено время КД на 4 минуты
+    base_cooldown = 4 * 60
     actual_cooldown = int(base_cooldown / cd_mult)
     
     now = time.time()
@@ -901,15 +961,9 @@ async def cmd_getcard(message: types.Message):
         mins, secs = divmod(left, 60)
         return await message.answer(f"⏳ <b>Колода перемешивается!</b>\nВозвращайся через {mins} мин. {secs} сек.")
         
-    all_cards = await fetch_all("SELECT * FROM cards WHERE drop_chance > 0 AND rarity != 'Leaderboard'")
-    if not all_cards: return await message.answer("😔 В базе пока нет доступных для выбивания карт.")
-        
-    weights = [c['drop_chance'] * (luck_mult if c['drop_chance'] < 15.0 else 1.0) for c in all_cards]
-    won_card = random.choices(all_cards, weights=weights, k=1)[0]
-    
-    mutation = roll_mutation()
-    _, serial, _ = await give_card_to_user(user['id'], won_card['id'], mutation, won_card['rarity'])
-    won_card['serial_number'] = serial
+    won_list = await give_multiple_cards(user['id'], 1)
+    if not won_list: return await message.answer("😔 В базе пока нет доступных для выбивания карт.")
+    won_card = won_list[0]
         
     await execute_db("UPDATE users SET last_getcard = ? WHERE id = ?", (now, user['id']))
     
@@ -920,12 +974,17 @@ async def cmd_getcard(message: types.Message):
     n_fmt = format_card_name(won_card)
     rarity_text = format_rarity_display(won_card['rarity'])
     
+    mutation = won_card['mutation']
     mult = get_mutation_multiplier(mutation)
     mut_str = ""
     if mutation == "Gold": mut_str = "⭐ <b>ЗОЛОТАЯ! (+10% Статов)</b>\n"
     elif mutation == "Rainbow": mut_str = "🌈 <b>РАДУЖНАЯ! (+20% Статов)</b>\n"
     
-    msg = f"🎉 <b>ВЫ ВЫБИЛИ КАРТУ!</b>\n\n{mut_str}🃏 {n_fmt}\n💎 <b>Редкость:</b> {rarity_text}\n"
+    msg = ""
+    if won_card.get('is_pity'):
+        msg += f"🌟 <b>СИСТЕМА PITY СРАБОТАЛА! ГАРАНТИРОВАННЫЙ {won_card['pity_type']}!</b> 🌟\n\n"
+        
+    msg += f"🎉 <b>ВЫ ВЫБИЛИ КАРТУ!</b>\n\n{mut_str}🃏 {n_fmt}\n💎 <b>Редкость:</b> {rarity_text}\n"
     
     if won_card['class_type'] == 'Booster': 
         msg += f"✨ <b>БУСТЕР</b>\n⚔️ Урон: x{round(won_card['booster_dmg_mult']*mult, 2)} | ❤️ ХП: x{round(won_card['booster_hp_mult']*mult, 2)}\n\n"
@@ -968,7 +1027,8 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
     page_items = all_cards[start_idx:end_idx]
     
     for i, c in enumerate(page_items, start_idx + 1):
-        inv_stats = await fetch_all("SELECT mutation, SUM(count) as c FROM inventory WHERE card_id = ? GROUP BY mutation", (c['id'],))
+        # Суперадмин не учитывается в экзистах глобально
+        inv_stats = await fetch_all("SELECT mutation, SUM(count) as c FROM inventory WHERE card_id = ? AND user_id != ? GROUP BY mutation", (c['id'], SUPER_ADMIN_ID))
         total_exists = sum(item['c'] for item in inv_stats if item['c'])
         
         mut_texts = []
@@ -978,7 +1038,7 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
             
         mut_str = f"\n  └ <i>Из них: {', '.join(mut_texts)}</i>" if mut_texts else ""
         
-        n_fmt = format_card_name(c)
+        n_fmt = format_card_name(c).replace(" <b>[#-001]</b>", "") # Если вдруг покажет серийник админа
         r_fmt = format_rarity_display(c['rarity'])
         
         real_chance = (weights_dict.get(c['id'], 0) / total_w) * 100 if total_w > 0 else 0
@@ -1041,7 +1101,7 @@ async def get_inventory_text_and_kb(user_id: int, page: int = 0, items_per_page:
     
     text = f"🎒 <b>Ваш Инвентарь (Стр. {page+1}/{total_pages}):</b>\n\n"
     for item in page_items:
-        n_fmt = format_card_name(item)
+        n_fmt = format_card_name(item).replace(" <b>[#-001]</b>", "")
         mut_emoji = ""
         if item['mutation'] == "Gold": mut_emoji = "⭐ "
         elif item['mutation'] == "Rainbow": mut_emoji = "🌈 "
@@ -1177,22 +1237,45 @@ async def get_team_data(user_id: int):
                 team.append(card)
     return team
 
-async def get_bot_team(user_id: int, difficulty_mult: float):
-    user_team = await get_team_data(user_id)
-    user_power = sum(c['damage'] + c['hp'] for c in user_team) if user_team else 300
-    avg_card_power = max(50, user_power / 3)
-    
-    # AI теперь не может использовать Leaderboard карты!
+async def get_bot_team(user_id: int, difficulty_mult: float, rank_name: str):
     all_cards = await fetch_all("SELECT id, name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards WHERE rarity != 'Leaderboard'")
     if len(all_cards) < 3: return []
     
-    # Снизили порог силы ИИ, сделав бои капельку легче (3.0 вместо 3.5)
-    valid_cards = [c for c in all_cards if (c['damage'] + c['hp']) <= avg_card_power * 3.0 * difficulty_mult or c['class_type'] == 'Booster']
-    if len(valid_cards) < 3: valid_cards = all_cards
+    by_rarity = {}
+    for c in all_cards:
+        by_rarity.setdefault(c['rarity'], []).append(c)
+        
+    base_rank = rank_name.split()[0]
+    team_selection = []
     
-    team_selection = random.sample(valid_cards, min(3, len(valid_cards)))
-    if len(team_selection) < 3:
-        team_selection += random.choices(all_cards, k=3-len(team_selection))
+    # Алгоритм подбора ботов на основе ранга игрока
+    for _ in range(3):
+        r = random.random()
+        small_chance = min(0.3, 0.05 * difficulty_mult)
+        pool = []
+        
+        if base_rank == "Bronze":
+            if r < small_chance and 'Rare' in by_rarity: pool = by_rarity['Rare']
+            else: pool = by_rarity.get('Basic', []) + by_rarity.get('Uncommon', [])
+        elif base_rank == "Silver":
+            if r < small_chance and 'Epic' in by_rarity: pool = by_rarity['Epic']
+            else: pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', [])
+        elif base_rank == "Gold":
+            if r < small_chance and 'Legendary' in by_rarity: pool = by_rarity['Legendary']
+            else: pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', [])
+        elif base_rank == "Platina":
+            if r < small_chance and 'Mythic' in by_rarity: pool = by_rarity['Mythic']
+            else: pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', [])
+        elif base_rank == "Diamond":
+            if r < small_chance and 'Super' in by_rarity: pool = by_rarity['Super']
+            else: pool = by_rarity.get('Legendary', []) + by_rarity.get('Mythic', [])
+        elif base_rank == "Ruby":
+            pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', [])
+        
+        if not pool:
+            pool = all_cards
+            
+        team_selection.append(random.choice(pool))
         
     team_copies = []
     for c in team_selection:
@@ -1403,8 +1486,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
             rank = await get_user_rank(user['trophies'])
             
-            # Усложнили получение монет: уменьшили базовый рандом до 25-90 монет
-            coins_won = int(random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale)
+            # Срезаем 15% шекелей, умножая на 0.85
+            coins_won = int(random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85)
             won_t = await get_dynamic_trophies(rank['name'], diff_trophies_scale)
             
             await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
@@ -1443,17 +1526,16 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     trophies_scale = 1.0
     diff_name = "Средний"
     
-    # Облегчили матчи: уменьшили силу ИИ во всех трёх режимах
     if diff_type == "easy":
-        power_mult = 0.7  # было 0.8
+        power_mult = 0.7  
         trophies_scale = 0.5
         diff_name = "Лёгкий"
     elif diff_type == "med":
-        power_mult = 1.1  # было 1.3
+        power_mult = 1.1  
         trophies_scale = 1.0
         diff_name = "Средний"
     elif diff_type == "hard":
-        power_mult = 1.6  # было 2.0
+        power_mult = 1.6  
         trophies_scale = 1.5
         diff_name = "Сложный"
         
@@ -1464,7 +1546,7 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     rank = await get_user_rank(user['trophies'])
     
     final_diff_mult = rank['difficulty_mult'] * power_mult
-    team2 = await get_bot_team(callback.from_user.id, final_diff_mult)
+    team2 = await get_bot_team(callback.from_user.id, final_diff_mult, rank['name'])
     
     if not team2: return await callback.message.edit_text("❌ На сервере нет карт для бота.")
         
@@ -1508,10 +1590,6 @@ async def process_pvp_target(message: types.Message, state: FSMContext):
         await state.clear()
         return await message.answer("❌ Игрок сейчас находится в бою!")
 
-    if target_user['id'] in active_trades_users:
-        await state.clear()
-        return await message.answer("❌ Игрок занят обменом!")
-        
     challenger = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
     challenger_name = get_display_name(challenger)
     
@@ -1558,7 +1636,6 @@ async def callback_pvp_accept(callback: types.CallbackQuery):
     active_combats.add(challenger_id)
     active_combats.add(target_id)
     
-    # Запускаем трансляцию PvP для ОБОИХ игроков в их личные сообщения синхронно!
     asyncio.create_task(run_pvp_dual_broadcast(challenger_id, target_id, p1_name, p2_name, t1, t2))
     await callback.message.delete()
     await callback.answer()
@@ -1574,7 +1651,6 @@ async def callback_pvp_decline(callback: types.CallbackQuery):
     await callback.answer()
 
 async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: str, t1: list, t2: list):
-    # Создаем стартовые сообщения у обоих игроков
     msg1 = await bot.send_message(p1_id, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!")
     msg2 = await bot.send_message(p2_id, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3... сек!")
     await asyncio.sleep(1)
@@ -1650,558 +1726,6 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     active_combats.discard(p2_id)
 
 # ========================================================================
-# СИСТЕМА ОБМЕНА КАРТАМИ (ТРЕЙДЫ)
-# ========================================================================
-@dp.message(F.text == "🤝 Трейды")
-async def cmd_trade_start(message: types.Message, state: FSMContext):
-    if await check_ban(message.from_user.id): return
-    
-    # Очищаем недействительные/старые зависшие сессии этого пользователя
-    now_ts = time.time()
-    stale_trades = []
-    for t_id, t_data in list(active_trades.items()):
-        if now_ts - t_data.get('created_at', 0) > 300: # 5 минут тайм-аут
-            stale_trades.append(t_id)
-    for t_id in stale_trades:
-        t_data = active_trades.get(t_id)
-        if t_data:
-            p1 = t_data['p1']
-            p2 = t_data['p2']
-            active_trades_users.discard(p1)
-            active_trades_users.discard(p2)
-            active_trades.pop(t_id, None)
-            try: await bot.send_message(p1, "⏳ Время сессии обмена вышло (5 минут). Обмен аннулирован.")
-            except: pass
-            try: await bot.send_message(p2, "⏳ Время сессии обмена вышло (5 минут). Обмен аннулирован.")
-            except: pass
-
-    # Механизм самолечения: если статус заблокирован, но реальной сессии нет — сбрасываем блокировку
-    is_in_any_active_trade = False
-    for t_data in active_trades.values():
-        if message.from_user.id in [t_data['p1'], t_data['p2']]:
-            is_in_any_active_trade = True
-            break
-    if message.from_user.id in active_trades_users and not is_in_any_active_trade:
-        active_trades_users.discard(message.from_user.id)
-
-    if message.from_user.id in active_trades_users or message.from_user.id in active_combats:
-        return await message.answer("❌ Вы не можете начать обмен в данный момент (вы уже заняты обменом или боем)!")
-        
-    await message.answer("🤝 <b>Предложение обмена</b>\nВведите @username или ID игрока, с которым вы хотите провести трейд:")
-    await state.set_state(TradeState.waiting_target)
-
-@dp.message(TradeState.waiting_target)
-async def process_trade_target(message: types.Message, state: FSMContext):
-    val = message.text.strip()
-    target_user = None
-    
-    if val.isdigit():
-        target_user = await fetch_one("SELECT * FROM users WHERE id = ?", (int(val),))
-    else:
-        target_username = val.lstrip('@')
-        target_user = await fetch_one("SELECT * FROM users WHERE username = ?", (target_username,))
-        
-    if not target_user:
-        await state.clear()
-        return await message.answer("❌ Этот игрок не найден в базе данных.")
-        
-    if target_user['id'] == message.from_user.id:
-        await state.clear()
-        return await message.answer("❌ Вы не можете торговать с самим собой!")
-
-    # Принудительно очищаем зависшие состояния цели обмена перед стартом
-    is_target_in_any_trade = False
-    for t_data in active_trades.values():
-        if target_user['id'] in [t_data['p1'], t_data['p2']]:
-            is_target_in_any_trade = True
-            break
-    if target_user['id'] in active_trades_users and not is_target_in_any_trade:
-        active_trades_users.discard(target_user['id'])
-        
-    if target_user['id'] in active_trades_users or target_user['id'] in active_combats:
-        await state.clear()
-        return await message.answer("❌ Игрок сейчас занят другим обменом или боем.")
-        
-    initiator = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
-    initiator_name = get_display_name(initiator)
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="🤝 Принять трейд", callback_data=f"tr_invite_accept_{initiator['id']}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"tr_invite_decline_{initiator['id']}")
-        ]
-    ])
-    
-    try:
-        await bot.send_message(
-            target_user['id'], 
-            f"🤝 Игрок <b>{initiator_name}</b> предлагает вам совершить обмен карточками!",
-            reply_markup=kb
-        )
-        await message.answer(f"📨 Предложение обмена успешно отправлено игроку {get_display_name(target_user)}. Ждем его согласия...")
-    except Exception:
-        await message.answer("❌ Не удалось отправить предложение (возможно, игрок заблокировал бота).")
-    await state.clear()
-
-@dp.callback_query(F.data.startswith("tr_invite_accept_"))
-async def callback_trade_invite_accept(callback: types.CallbackQuery):
-    p1_id = int(callback.data.split("_")[3])
-    p2_id = callback.from_user.id
-    
-    if p1_id in active_trades_users or p2_id in active_trades_users:
-        return await callback.answer("❌ Один из участников обмена уже занят другим трейдом!", show_alert=True)
-        
-    active_trades_users.add(p1_id)
-    active_trades_users.add(p2_id)
-    
-    trade_id = f"{p1_id}_{p2_id}"
-    
-    p1_user = await fetch_one("SELECT * FROM users WHERE id = ?", (p1_id,))
-    p2_user = await fetch_one("SELECT * FROM users WHERE id = ?", (p2_id,))
-    
-    # Инициализация структуры трейда с добавлением отметки времени
-    active_trades[trade_id] = {
-        "p1": p1_id,
-        "p2": p2_id,
-        "p1_name": get_display_name(p1_user),
-        "p2_name": get_display_name(p2_user),
-        "p1_cards": {}, # dict {inventory_id: count_in_trade}
-        "p2_cards": {}, # dict {inventory_id: count_in_trade}
-        "p1_accepted": False,
-        "p2_accepted": False,
-        "p1_msg_id": None,
-        "p2_msg_id": None,
-        "created_at": time.time()
-    }
-    
-    await callback.message.delete()
-    
-    # Отправляем интерфейс трейда обоим игрокам
-    await send_trade_boards(trade_id)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tr_invite_decline_"))
-async def callback_trade_invite_decline(callback: types.CallbackQuery):
-    p1_id = int(callback.data.split("_")[3])
-    p2_name = get_display_name(await fetch_one("SELECT * FROM users WHERE id = ?", (callback.from_user.id,)))
-    try:
-        await bot.send_message(p1_id, f"❌ Игрок <b>{p2_name}</b> отклонил ваше предложение обмена.")
-    except: pass
-    await callback.message.edit_text("❌ Вы отклонили предложение обмена.")
-    await callback.answer()
-
-async def get_trade_board_text_and_kb(trade_id: str, current_user_id: int):
-    trade = active_trades.get(trade_id)
-    if not trade:
-        return "❌ Обмен не найден или завершен.", None
-        
-    p1_id = trade['p1']
-    p2_id = trade['p2']
-    
-    # Формируем списки предложенных карт
-    p1_offer_strs = []
-    if trade['p1_cards']:
-        inv_ids = ",".join(map(str, trade['p1_cards'].keys()))
-        rows = await fetch_all(f"SELECT i.id, c.name, c.rarity, i.mutation, i.serial_number FROM inventory i JOIN cards c ON i.card_id = c.id WHERE i.id IN ({inv_ids})")
-        for r in rows:
-            count = trade['p1_cards'][r['id']]
-            n_fmt = format_card_name(r)
-            p1_offer_strs.append(f"• {n_fmt} — {count} шт.")
-    else:
-        p1_offer_strs.append("<i>Ничего не предложено</i>")
-        
-    p2_offer_strs = []
-    if trade['p2_cards']:
-        inv_ids = ",".join(map(str, trade['p2_cards'].keys()))
-        rows = await fetch_all(f"SELECT i.id, c.name, c.rarity, i.mutation, i.serial_number FROM inventory i JOIN cards c ON i.card_id = c.id WHERE i.id IN ({inv_ids})")
-        for r in rows:
-            count = trade['p2_cards'][r['id']]
-            n_fmt = format_card_name(r)
-            p2_offer_strs.append(f"• {n_fmt} — {count} шт.")
-    else:
-        p2_offer_strs.append("<i>Ничего не предложено</i>")
-        
-    st_p1 = "✅ Подтвердил" if trade['p1_accepted'] else "⏳ Подготавливает предложение"
-    st_p2 = "✅ Подтвердил" if trade['p2_accepted'] else "⏳ Подготавливает предложение"
-    
-    text = (
-        f"🤝 <b>ОБМЕН КАРТАМИ В РЕАЛЬНОМ ВРЕМЕНИ</b>\n\n"
-        f"🔵 <b>Игрок {trade['p1_name']}:</b>\n" + "\n".join(p1_offer_strs) + f"\n└ Статус: <i>{st_p1}</i>\n\n"
-        f"🔴 <b>Игрок {trade['p2_name']}:</b>\n" + "\n".join(p2_offer_strs) + f"\n└ Статус: <i>{st_p2}</i>\n\n"
-        f"⚠️ Любое изменение сбрасывает статус вашего подтверждения."
-    )
-    
-    # Клавиатура управления трейдом
-    btn_confirm_text = "✅ Подтвердить обмен" if not ((current_user_id == p1_id and trade['p1_accepted']) or (current_user_id == p2_id and trade['p2_accepted'])) else "⏳ Отменить подтверждение"
-    
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить карточку", callback_data=f"tr_addlist_{trade_id}_0")],
-        [InlineKeyboardButton(text="🧹 Очистить мое предложение", callback_data=f"tr_clear_{trade_id}")],
-        [InlineKeyboardButton(text=btn_confirm_text, callback_data=f"tr_confirm_{trade_id}")],
-        [InlineKeyboardButton(text="⛔ Отклонить трейд", callback_data=f"tr_decline_{trade_id}")]
-    ])
-    
-    return text, kb
-
-async def send_trade_boards(trade_id: str):
-    trade = active_trades.get(trade_id)
-    if not trade: return
-    
-    # Доски для p1 и p2
-    t1, k1 = await get_trade_board_text_and_kb(trade_id, trade['p1'])
-    t2, k2 = await get_trade_board_text_and_kb(trade_id, trade['p2'])
-    
-    m1 = await bot.send_message(trade['p1'], t1, reply_markup=k1)
-    m2 = await bot.send_message(trade['p2'], t2, reply_markup=k2)
-    
-    trade['p1_msg_id'] = m1.message_id
-    trade['p2_msg_id'] = m2.message_id
-
-async def update_trade_boards(trade_id: str):
-    trade = active_trades.get(trade_id)
-    if not trade: return
-    
-    # Перерисовываем доски у обоих игроков
-    for role in ['p1', 'p2']:
-        user_id = trade[role]
-        msg_id = trade[f"{role}_msg_id"]
-        text, kb = await get_trade_board_text_and_kb(trade_id, user_id)
-        
-        try:
-            await bot.edit_message_text(chat_id=user_id, message_id=msg_id, text=text, reply_markup=kb)
-        except TelegramAPIError as e:
-            if "message is not modified" in str(e).lower():
-                continue
-            # ОПТИМИЗАЦИЯ: Если сообщение было удалено пользователем, отправляем новое и сохраняем его ID, предотвращая зависание
-            try:
-                new_m = await bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
-                trade[f"{role}_msg_id"] = new_m.message_id
-            except Exception as ex:
-                logging.error(f"Не удалось воссоздать панель трейда для {user_id}: {ex}")
-
-@dp.callback_query(F.data.startswith("tr_addlist_"))
-async def callback_trade_addlist(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    page = int(parts[4])
-    
-    trade = active_trades.get(trade_id)
-    if not trade:
-        return await callback.answer("❌ Обмен завершен или отменен.", show_alert=True)
-        
-    user_id = callback.from_user.id
-    
-    # Получаем инвентарь игрока
-    inv_items = await fetch_all("""
-        SELECT i.id, c.name, c.rarity, i.count, i.mutation, i.serial_number 
-        FROM inventory i JOIN cards c ON i.card_id = c.id 
-        WHERE i.user_id = ?
-    """, (user_id,))
-    
-    if not inv_items:
-        return await callback.answer("🎒 Ваш инвентарь пуст!", show_alert=True)
-        
-    # Формируем кнопки для выбора
-    btn_items = []
-    for item in inv_items:
-        user_offers = trade['p1_cards'] if user_id == trade['p1'] else trade['p2_cards']
-        in_trade = user_offers.get(item['id'], 0)
-        available = item['count'] - in_trade
-        
-        if available <= 0:
-            continue
-            
-        r_em = RARITY_EMOJI.get(item['rarity'], "⚪")
-        mut_emoji = "⭐ " if item['mutation'] == 'Gold' else ("🌈 " if item['mutation'] == 'Rainbow' else "")
-        s_str = f" [#{item['serial_number']:04d}]" if item['serial_number'] > 0 else ""
-        
-        btn_items.append({
-            "id": item['id'],
-            "btn_text": f"{mut_emoji}{r_em} {item['name']}{s_str} (Доступно: {available})"
-        })
-        
-    if not btn_items:
-        return await callback.answer("❌ Вы выставили на обмен максимум копий всех своих карт!", show_alert=True)
-        
-    items_per_page = 6
-    total_pages = max(1, math.ceil(len(btn_items) / items_per_page))
-    page = max(0, min(page, total_pages - 1))
-    
-    start_idx = page * items_per_page
-    end_idx = start_idx + items_per_page
-    page_items = btn_items[start_idx:end_idx]
-    
-    kb_list = []
-    for item in page_items:
-        kb_list.append([InlineKeyboardButton(text=item['btn_text'], callback_data=f"tr_addcard_{trade_id}_{item['id']}")])
-        
-    nav_row = []
-    if page > 0: nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"tr_addlist_{trade_id}_{page-1}"))
-    if total_pages > 1: nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
-    if page < total_pages - 1: nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"tr_addlist_{trade_id}_{page+1}"))
-    if nav_row: kb_list.append(nav_row)
-    
-    kb_list.append([InlineKeyboardButton(text="🔙 Назад к доске трейда", callback_data=f"tr_board_{trade_id}")])
-    
-    await callback.message.edit_text("👇 Выберите карточку для добавления в трейд:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_list))
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tr_addcard_"))
-async def callback_trade_addcard(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    inv_id = int(parts[4])
-    
-    trade = active_trades.get(trade_id)
-    if not trade:
-        return await callback.answer("❌ Обмен завершен или отменен.", show_alert=True)
-        
-    user_id = callback.from_user.id
-    offers = trade['p1_cards'] if user_id == trade['p1'] else trade['p2_cards']
-    
-    # Проверка наличия
-    inv_row = await fetch_one("SELECT count FROM inventory WHERE id = ? AND user_id = ?", (inv_id, user_id))
-    if not inv_row:
-        return await callback.answer("❌ Ошибка владения карточкой.", show_alert=True)
-        
-    current_in_trade = offers.get(inv_id, 0)
-    if current_in_trade >= inv_row['count']:
-        return await callback.answer("❌ У вас больше нет копий этой карты!", show_alert=True)
-        
-    offers[inv_id] = current_in_trade + 1
-    
-    # Любое изменение в обмене сбрасывает подтверждения
-    trade['p1_accepted'] = False
-    trade['p2_accepted'] = False
-    
-    # Сначала безопасно удаляем меню выбора карт
-    try:
-        await callback.message.delete()
-    except:
-        pass
-        
-    # Затем обновляем основные доски трейда
-    await update_trade_boards(trade_id)
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tr_board_"))
-async def callback_trade_board_return(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    
-    trade = active_trades.get(trade_id)
-    if not trade:
-        return await callback.message.edit_text("❌ Обмен завершен или отменен.")
-        
-    try:
-        await callback.message.delete()
-    except:
-        pass
-        
-    # Воссоздаем доски
-    t_u, k_u = await get_trade_board_text_and_kb(trade_id, callback.from_user.id)
-    new_m = await bot.send_message(callback.from_user.id, t_u, reply_markup=k_u)
-    
-    if callback.from_user.id == trade['p1']:
-        trade['p1_msg_id'] = new_m.message_id
-    else:
-        trade['p2_msg_id'] = new_m.message_id
-        
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tr_clear_"))
-async def callback_trade_clear(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    
-    trade = active_trades.get(trade_id)
-    if not trade: return await callback.answer("❌ Трейд завершен.", show_alert=True)
-    
-    user_id = callback.from_user.id
-    if user_id == trade['p1']:
-        trade['p1_cards'].clear()
-    else:
-        trade['p2_cards'].clear()
-        
-    trade['p1_accepted'] = False
-    trade['p2_accepted'] = False
-    
-    await update_trade_boards(trade_id)
-    await callback.answer("🧹 Ваше предложение полностью очищено.")
-
-@dp.callback_query(F.data.startswith("tr_decline_"))
-async def callback_trade_decline(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    
-    trade = active_trades.get(trade_id)
-    if not trade: return await callback.answer()
-    
-    p1 = trade['p1']
-    p2 = trade['p2']
-    
-    active_trades_users.discard(p1)
-    active_trades_users.discard(p2)
-    active_trades.pop(trade_id, None)
-    
-    try: await bot.send_message(p1, "❌ Обмен картами отменен одним из игроков.")
-    except: pass
-    try: await bot.send_message(p2, "❌ Обмен картами отменен одним из игроков.")
-    except: pass
-    
-    try: await bot.delete_message(p1, trade['p1_msg_id'])
-    except: pass
-    try: await bot.delete_message(p2, trade['p2_msg_id'])
-    except: pass
-    
-    await callback.answer()
-
-@dp.callback_query(F.data.startswith("tr_confirm_"))
-async def callback_trade_confirm(callback: types.CallbackQuery):
-    parts = callback.data.split("_")
-    trade_id = f"{parts[2]}_{parts[3]}"
-    
-    trade = active_trades.get(trade_id)
-    if not trade: return await callback.answer("❌ Обмен не найден.", show_alert=True)
-    
-    user_id = callback.from_user.id
-    if user_id == trade['p1']:
-        trade['p1_accepted'] = not trade['p1_accepted']
-    else:
-        trade['p2_accepted'] = not trade['p2_accepted']
-        
-    if trade['p1_accepted'] and trade['p2_accepted']:
-        # Оба согласились! Проводим безопасный транзакционный обмен!
-        p1 = trade['p1']
-        p2 = trade['p2']
-        
-        db = await get_db_connection()
-        try:
-            # 1. Передаем карты от игрока 1 игроку 2
-            for inv_id, count in list(trade['p1_cards'].items()):
-                # Получаем детали строки
-                cursor = await db.execute("SELECT * FROM inventory WHERE id = ? AND user_id = ?", (inv_id, p1))
-                row = await cursor.fetchone()
-                if not row or row['count'] < count:
-                    raise ValueError("Ошибка валидации трейда: Недостаточно карт.")
-                
-                card_id = row['card_id']
-                mutation = row['mutation']
-                serial = row['serial_number']
-                
-                # Вычитаем у игрока 1
-                if row['count'] == count:
-                    await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
-                    # Сбрасываем экипировку, если карт этой категории не осталось
-                    for slot in ['equip1', 'equip2', 'equip3']:
-                        await db.execute(f"UPDATE users SET {slot} = 0 WHERE id = ? AND {slot} = ?", (p1, card_id))
-                else:
-                    await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (count, inv_id))
-                
-                # Добавляем игроку 2
-                card_row = await db.execute("SELECT rarity FROM cards WHERE id = ?", (card_id,))
-                card_res = await card_row.fetchone()
-                rarity = card_res['rarity'] if card_res else 'Basic'
-                
-                if needs_serial_number(rarity, mutation):
-                    # Принудительно вставляем с прежним серийником
-                    await db.execute(
-                        "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, ?, ?, ?)",
-                        (p2, card_id, count, mutation, serial)
-                    )
-                else:
-                    # Стакаем обычные копии
-                    m_cursor = await db.execute(
-                        "SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND serial_number = 0",
-                        (p2, card_id, mutation)
-                    )
-                    m_row = await m_cursor.fetchone()
-                    if m_row:
-                        await db.execute("UPDATE inventory SET count = count + ? WHERE id = ?", (count, m_row['id']))
-                    else:
-                        await db.execute(
-                            "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, ?, ?, 0)",
-                            (p2, card_id, count, mutation)
-                        )
-            
-            # 2. Передаем карты от игрока 2 игроку 1
-            for inv_id, count in list(trade['p2_cards'].items()):
-                cursor = await db.execute("SELECT * FROM inventory WHERE id = ? AND user_id = ?", (inv_id, p2))
-                row = await cursor.fetchone()
-                if not row or row['count'] < count:
-                    raise ValueError("Ошибка валидации трейда: Недостаточно карт.")
-                
-                card_id = row['card_id']
-                mutation = row['mutation']
-                serial = row['serial_number']
-                
-                # Вычитаем у игрока 2
-                if row['count'] == count:
-                    await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
-                    for slot in ['equip1', 'equip2', 'equip3']:
-                        await db.execute(f"UPDATE users SET {slot} = 0 WHERE id = ? AND {slot} = ?", (p2, card_id))
-                else:
-                    await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (count, inv_id))
-                
-                # Добавляем игроку 1
-                card_row = await db.execute("SELECT rarity FROM cards WHERE id = ?", (card_id,))
-                card_res = await card_row.fetchone()
-                rarity = card_res['rarity'] if card_res else 'Basic'
-                
-                if needs_serial_number(rarity, mutation):
-                    await db.execute(
-                        "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, ?, ?, ?)",
-                        (p1, card_id, count, mutation, serial)
-                    )
-                else:
-                    m_cursor = await db.execute(
-                        "SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND serial_number = 0",
-                        (p1, card_id, mutation)
-                    )
-                    m_row = await m_cursor.fetchone()
-                    if m_row:
-                        await db.execute("UPDATE inventory SET count = count + ? WHERE id = ?", (count, m_row['id']))
-                    else:
-                        await db.execute(
-                            "INSERT INTO inventory (user_id, card_id, count, mutation, serial_number) VALUES (?, ?, ?, ?, 0)",
-                            (p1, card_id, count, mutation)
-                        )
-            await db.commit()
-            
-            # Успешное логирование сделки
-            success_text = "🎉 <b>Трейд успешно завершен!</b> Предложенные карточки перенесены в инвентарь участников обмена."
-            try: await bot.send_message(p1, success_text)
-            except: pass
-            try: await bot.send_message(p2, success_text)
-            except: pass
-            
-        except Exception as e:
-            await db.rollback()
-            try: await bot.send_message(p1, "❌ Трейд завершился аварийным сбоем. База данных восстановлена до исходного состояния.")
-            except: pass
-            try: await bot.send_message(p2, "❌ Трейд завершился аварийным сбоем. База данных восстановлена до исходного состояния.")
-            except: pass
-            logging.error(f"Error during execution of secure trade transaction: {e}")
-            
-        finally:
-            await db.close()
-            
-        # Удаляем сообщения досок и чистим кэш обмена
-        try: await bot.delete_message(p1, trade['p1_msg_id'])
-        except: pass
-        try: await bot.delete_message(p2, trade['p2_msg_id'])
-        except: pass
-        
-        active_trades_users.discard(p1)
-        active_trades_users.discard(p2)
-        active_trades.pop(trade_id, None)
-        
-    else:
-        # Просто обновляем доски
-        await update_trade_boards(trade_id)
-        await callback.answer()
-
-# ========================================================================
 # ПАНЕЛЬ АДМИНИСТРАТОРА
 # ========================================================================
 def get_admin_main_kb():
@@ -2224,7 +1748,7 @@ async def cq_adm_main(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_admins")
 async def cq_adm_admins(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID: return await callback.answer("Только для... Супер-Админа!", show_alert=True)
+    if callback.from_user.id != SUPER_ADMIN_ID: return await callback.answer("Только для Супер-Админа!", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить", callback_data="adm_add_admin"), InlineKeyboardButton(text="➖ Удалить", callback_data="adm_del_admin")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
@@ -2480,7 +2004,7 @@ async def cq_adm_users(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🎁 Выдать карту", callback_data="adm_usr_givecard")],
         [InlineKeyboardButton(text="💰 Выдать шекели", callback_data="adm_usr_give_coins"),
          InlineKeyboardButton(text="🏆 Выдать кубки", callback_data="adm_usr_give_trophies")],
-        [InlineKeyboardButton(text="🔄 Сбросить бой / трейд", callback_data="adm_usr_reset_battle")],
+        [InlineKeyboardButton(text="🔄 Сбросить бой", callback_data="adm_usr_reset_battle")],
         [InlineKeyboardButton(text="🔨 Бан / Разбан", callback_data="adm_usr_ban")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
@@ -2554,7 +2078,7 @@ async def adm_usr_give_trophies_amount(message: types.Message, state: FSMContext
 
 @dp.callback_query(F.data == "adm_usr_reset_battle")
 async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для сброса состояния боя и трейда:")
+    await callback.message.answer("Введите ID игрока для сброса состояния боя:")
     await state.set_state(AdminManage.reset_battle_id)
     await callback.answer()
 
@@ -2562,42 +2086,13 @@ async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMCo
 async def adm_usr_reset_battle_finish(message: types.Message, state: FSMContext):
     try:
         uid = int(message.text)
-        reset_performed = False
-        
-        # 1. Сброс состояния боя
         if uid in active_combats:
             active_combats.discard(uid)
-            reset_performed = True
             await message.answer(f"✅ Состояние боя для игрока {uid} успешно сброшено.")
             await log_admin(message.from_user.id, f"Сбросил состояние боя для {uid}")
-            
-        # 2. Сброс зависшего трейда
-        if uid in active_trades_users:
-            active_trades_users.discard(uid)
-            reset_performed = True
-            
-            # Находим и аннулируем все сессии трейда с этим игроком
-            broken_trade_ids = []
-            for t_id, t_data in list(active_trades.items()):
-                if t_data['p1'] == uid or t_data['p2'] == uid:
-                    broken_trade_ids.append(t_id)
-                    other_user_id = t_data['p2'] if t_data['p1'] == uid else t_data['p1']
-                    active_trades_users.discard(other_user_id)
-                    try:
-                        await bot.send_message(other_user_id, "⚠️ Ваш активный трейд был принудительно сброшен администратором.")
-                    except:
-                        pass
-            for t_id in broken_trade_ids:
-                active_trades.pop(t_id, None)
-                
-            await message.answer(f"✅ Активные трейд-блокировки для игрока {uid} (и его напарника, если был) успешно аннулированы.")
-            await log_admin(message.from_user.id, f"Принудительно сбросил трейд для {uid}")
-            
-        if not reset_performed:
-            # На всякий случай подчищаем, даже если нет в сетах, но вдруг есть скрытая сессия
-            active_trades_users.discard(uid)
+        else:
             active_combats.discard(uid)
-            await message.answer("ℹ️ Игрок не находился в активном поиске боя или трейде. Системные флаги принудительно очищены.")
+            await message.answer("ℹ️ Игрок не находился в активном поиске боя. Системные флаги принудительно очищены.")
             
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
@@ -2689,7 +2184,6 @@ async def adm_lb_main(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🎖 10-20 Места", callback_data="lb_edit_10_20")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
-    # Текст изменен на 2 дня
     await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите позицию для редактирования наград (выдаются каждые 2 дня):", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("lb_edit_"))
@@ -2930,7 +2424,7 @@ async def main():
     ]
     await bot.set_my_commands(commands)
     
-    logging.info("🤖 Карточный бот запущен (Версия с защищенными трейдами и Ruby-рангами)!")
+    logging.info("🤖 Карточный бот запущен (Версия с системой Pity и без трейдов)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
