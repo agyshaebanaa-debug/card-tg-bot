@@ -17,6 +17,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove,
     FSInputFile, BotCommand
 )
+from aiogram.exceptions import TelegramAPIError
 
 try:
     from PIL import Image, ImageOps, ImageDraw
@@ -323,7 +324,6 @@ class EventCD(StatesGroup):
 class AdminAnnounce(StatesGroup):
     content = State()
 
-# Новые состояния для трейдов и PvP
 class TradeState(StatesGroup):
     waiting_target = State()
 
@@ -608,7 +608,8 @@ async def leaderboard_rewards_task():
         try:
             settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
             now = time.time()
-            if settings and (now - settings['last_lb_reward'] >= 3 * 24 * 3600):
+            # Изменено на 2 дня вместо 3 дней
+            if settings and (now - settings['last_lb_reward'] >= 2 * 24 * 3600):
                 top_users = await fetch_all("SELECT id, trophies, username, first_name FROM users ORDER BY trophies DESC LIMIT 20")
                 if top_users:
                     for idx, user in enumerate(top_users):
@@ -636,9 +637,9 @@ async def leaderboard_rewards_task():
                         if reward_msgs:
                             msg_text = (
                                 f"🏆 <b>ГРАНДИОЗНАЯ НАГРАДА ЗА ТОП ИГРОКОВ!</b> 🏆\n\n"
-                                f"🎉 Поздравляем! По итогам последних 3 дней вы заняли почетное <b>{pos} место</b> в мировом рейтинге по кубкам!\n\n"
+                                f"🎉 Поздравляем! По итогам последних 2 дней вы заняли почетное <b>{pos} место</b> в мировом рейтинге по кубкам!\n\n"
                                 f"🎁 <b>Вот ваша заслуженная награда:</b>\n" + "\n".join([f"🔸 {m}" for m in reward_msgs]) + "\n\n"
-                                f"<i>Спасибо за вашу активность! Рейтинг был сброшен, новые награды через 3 дня! Удачи на арене!</i>"
+                                f"<i>Спасибо за вашу активность! Рейтинг был сброшен, новые награды через 2 дня! Удачи на арене!</i>"
                             )
                             try:
                                 await bot.send_message(user['id'], msg_text)
@@ -664,6 +665,24 @@ async def cmd_start(message: types.Message):
         (message.from_user.username, message.from_user.first_name, message.from_user.id)
     )
     
+    # Механизм самовосстановления: принудительный сброс зависшего трейда при команде /start
+    active_combats.discard(message.from_user.id)
+    active_trades_users.discard(message.from_user.id)
+    
+    # Ищем и очищаем поврежденные сессии трейда с участием этого игрока
+    broken_trades = []
+    for t_id, t_data in active_trades.items():
+        if t_data['p1'] == message.from_user.id or t_data['p2'] == message.from_user.id:
+            broken_trades.append(t_id)
+            other_p = t_data['p2'] if t_data['p1'] == message.from_user.id else t_data['p1']
+            active_trades_users.discard(other_p)
+            try:
+                await bot.send_message(other_p, "⚠️ Трейд был отменен, так как ваш напарник перезапустил бота.")
+            except:
+                pass
+    for t_id in broken_trades:
+        active_trades.pop(t_id, None)
+
     adm = await is_admin(message.from_user.id)
     await message.answer(
         "👋 <b>Добро пожаловать в Card Battle Bot!</b>\n\n"
@@ -749,7 +768,8 @@ async def cmd_top(message: types.Message):
         rank = await get_user_rank(u['trophies'])
         text += f"{i}. {name} — <b>{u['trophies']} 🏆</b> ({rank['name']})\n"
         
-    text += "\n🎁 <b>Награды за Топ (выдаются каждые 3 дня):</b>\n"
+    # Изменено на 2 дня вместо 3 дней
+    text += "\n🎁 <b>Награды за Топ (выдаются каждые 2 дня):</b>\n"
     brackets = ["1", "2", "3", "4_9", "10_20"]
     bracket_names = {"1": "🥇 1 место", "2": "🥈 2 место", "3": "🥉 3 место", "4_9": "🏅 4-9 места", "10_20": "🎖 10-20 места"}
     
@@ -1635,8 +1655,37 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
 @dp.message(F.text == "🤝 Трейды")
 async def cmd_trade_start(message: types.Message, state: FSMContext):
     if await check_ban(message.from_user.id): return
+    
+    # Очищаем недействительные/старые зависшие сессии этого пользователя
+    now_ts = time.time()
+    stale_trades = []
+    for t_id, t_data in list(active_trades.items()):
+        if now_ts - t_data.get('created_at', 0) > 300: # 5 минут тайм-аут
+            stale_trades.append(t_id)
+    for t_id in stale_trades:
+        t_data = active_trades.get(t_id)
+        if t_data:
+            p1 = t_data['p1']
+            p2 = t_data['p2']
+            active_trades_users.discard(p1)
+            active_trades_users.discard(p2)
+            active_trades.pop(t_id, None)
+            try: await bot.send_message(p1, "⏳ Время сессии обмена вышло (5 минут). Обмен аннулирован.")
+            except: pass
+            try: await bot.send_message(p2, "⏳ Время сессии обмена вышло (5 минут). Обмен аннулирован.")
+            except: pass
+
+    # Механизм самолечения: если статус заблокирован, но реальной сессии нет — сбрасываем блокировку
+    is_in_any_active_trade = False
+    for t_data in active_trades.values():
+        if message.from_user.id in [t_data['p1'], t_data['p2']]:
+            is_in_any_active_trade = True
+            break
+    if message.from_user.id in active_trades_users and not is_in_any_active_trade:
+        active_trades_users.discard(message.from_user.id)
+
     if message.from_user.id in active_trades_users or message.from_user.id in active_combats:
-        return await message.answer("❌ Вы не можете начать обмен в данный момент (вы заняты трейдом или боем)!")
+        return await message.answer("❌ Вы не можете начать обмен в данный момент (вы уже заняты обменом или боем)!")
         
     await message.answer("🤝 <b>Предложение обмена</b>\nВведите @username или ID игрока, с которым вы хотите провести трейд:")
     await state.set_state(TradeState.waiting_target)
@@ -1659,6 +1708,15 @@ async def process_trade_target(message: types.Message, state: FSMContext):
     if target_user['id'] == message.from_user.id:
         await state.clear()
         return await message.answer("❌ Вы не можете торговать с самим собой!")
+
+    # Принудительно очищаем зависшие состояния цели обмена перед стартом
+    is_target_in_any_trade = False
+    for t_data in active_trades.values():
+        if target_user['id'] in [t_data['p1'], t_data['p2']]:
+            is_target_in_any_trade = True
+            break
+    if target_user['id'] in active_trades_users and not is_target_in_any_trade:
+        active_trades_users.discard(target_user['id'])
         
     if target_user['id'] in active_trades_users or target_user['id'] in active_combats:
         await state.clear()
@@ -1701,7 +1759,7 @@ async def callback_trade_invite_accept(callback: types.CallbackQuery):
     p1_user = await fetch_one("SELECT * FROM users WHERE id = ?", (p1_id,))
     p2_user = await fetch_one("SELECT * FROM users WHERE id = ?", (p2_id,))
     
-    # Инициализация структуры трейда
+    # Инициализация структуры трейда с добавлением отметки времени
     active_trades[trade_id] = {
         "p1": p1_id,
         "p2": p2_id,
@@ -1712,7 +1770,8 @@ async def callback_trade_invite_accept(callback: types.CallbackQuery):
         "p1_accepted": False,
         "p2_accepted": False,
         "p1_msg_id": None,
-        "p2_msg_id": None
+        "p2_msg_id": None,
+        "created_at": time.time()
     }
     
     await callback.message.delete()
@@ -1802,14 +1861,23 @@ async def update_trade_boards(trade_id: str):
     trade = active_trades.get(trade_id)
     if not trade: return
     
-    t1, k1 = await get_trade_board_text_and_kb(trade_id, trade['p1'])
-    t2, k2 = await get_trade_board_text_and_kb(trade_id, trade['p2'])
-    
-    try: await bot.edit_message_text(chat_id=trade['p1'], message_id=trade['p1_msg_id'], text=t1, reply_markup=k1)
-    except: pass
-    
-    try: await bot.edit_message_text(chat_id=trade['p2'], message_id=trade['p2_msg_id'], text=t2, reply_markup=k2)
-    except: pass
+    # Перерисовываем доски у обоих игроков
+    for role in ['p1', 'p2']:
+        user_id = trade[role]
+        msg_id = trade[f"{role}_msg_id"]
+        text, kb = await get_trade_board_text_and_kb(trade_id, user_id)
+        
+        try:
+            await bot.edit_message_text(chat_id=user_id, message_id=msg_id, text=text, reply_markup=kb)
+        except TelegramAPIError as e:
+            if "message is not modified" in str(e).lower():
+                continue
+            # ОПТИМИЗАЦИЯ: Если сообщение было удалено пользователем, отправляем новое и сохраняем его ID, предотвращая зависание
+            try:
+                new_m = await bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+                trade[f"{role}_msg_id"] = new_m.message_id
+            except Exception as ex:
+                logging.error(f"Не удалось воссоздать панель трейда для {user_id}: {ex}")
 
 @dp.callback_query(F.data.startswith("tr_addlist_"))
 async def callback_trade_addlist(callback: types.CallbackQuery):
@@ -1906,7 +1974,13 @@ async def callback_trade_addcard(callback: types.CallbackQuery):
     trade['p1_accepted'] = False
     trade['p2_accepted'] = False
     
-    await callback.message.delete()
+    # Сначала безопасно удаляем меню выбора карт
+    try:
+        await callback.message.delete()
+    except:
+        pass
+        
+    # Затем обновляем основные доски трейда
     await update_trade_boards(trade_id)
     await callback.answer()
 
@@ -1919,7 +1993,11 @@ async def callback_trade_board_return(callback: types.CallbackQuery):
     if not trade:
         return await callback.message.edit_text("❌ Обмен завершен или отменен.")
         
-    await callback.message.delete()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+        
     # Воссоздаем доски
     t_u, k_u = await get_trade_board_text_and_kb(trade_id, callback.from_user.id)
     new_m = await bot.send_message(callback.from_user.id, t_u, reply_markup=k_u)
@@ -2146,7 +2224,7 @@ async def cq_adm_main(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_admins")
 async def cq_adm_admins(callback: types.CallbackQuery):
-    if callback.from_user.id != SUPER_ADMIN_ID: return await callback.answer("Только для Супер-Админа!", show_alert=True)
+    if callback.from_user.id != SUPER_ADMIN_ID: return await callback.answer("Только для... Супер-Админа!", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить", callback_data="adm_add_admin"), InlineKeyboardButton(text="➖ Удалить", callback_data="adm_del_admin")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
@@ -2402,7 +2480,7 @@ async def cq_adm_users(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🎁 Выдать карту", callback_data="adm_usr_givecard")],
         [InlineKeyboardButton(text="💰 Выдать шекели", callback_data="adm_usr_give_coins"),
          InlineKeyboardButton(text="🏆 Выдать кубки", callback_data="adm_usr_give_trophies")],
-        [InlineKeyboardButton(text="🔄 Сбросить бой", callback_data="adm_usr_reset_battle")],
+        [InlineKeyboardButton(text="🔄 Сбросить бой / трейд", callback_data="adm_usr_reset_battle")],
         [InlineKeyboardButton(text="🔨 Бан / Разбан", callback_data="adm_usr_ban")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
@@ -2476,7 +2554,7 @@ async def adm_usr_give_trophies_amount(message: types.Message, state: FSMContext
 
 @dp.callback_query(F.data == "adm_usr_reset_battle")
 async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для сброса состояния боя:")
+    await callback.message.answer("Введите ID игрока для сброса состояния боя и трейда:")
     await state.set_state(AdminManage.reset_battle_id)
     await callback.answer()
 
@@ -2484,12 +2562,43 @@ async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMCo
 async def adm_usr_reset_battle_finish(message: types.Message, state: FSMContext):
     try:
         uid = int(message.text)
+        reset_performed = False
+        
+        # 1. Сброс состояния боя
         if uid in active_combats:
             active_combats.discard(uid)
-            await message.answer(f"✅ Бой для игрока {uid} успешно сброшен.")
+            reset_performed = True
+            await message.answer(f"✅ Состояние боя для игрока {uid} успешно сброшено.")
             await log_admin(message.from_user.id, f"Сбросил состояние боя для {uid}")
-        else:
-            await message.answer("ℹ️ Этот игрок не находится в активном поиске или бою.")
+            
+        # 2. Сброс зависшего трейда
+        if uid in active_trades_users:
+            active_trades_users.discard(uid)
+            reset_performed = True
+            
+            # Находим и аннулируем все сессии трейда с этим игроком
+            broken_trade_ids = []
+            for t_id, t_data in list(active_trades.items()):
+                if t_data['p1'] == uid or t_data['p2'] == uid:
+                    broken_trade_ids.append(t_id)
+                    other_user_id = t_data['p2'] if t_data['p1'] == uid else t_data['p1']
+                    active_trades_users.discard(other_user_id)
+                    try:
+                        await bot.send_message(other_user_id, "⚠️ Ваш активный трейд был принудительно сброшен администратором.")
+                    except:
+                        pass
+            for t_id in broken_trade_ids:
+                active_trades.pop(t_id, None)
+                
+            await message.answer(f"✅ Активные трейд-блокировки для игрока {uid} (и его напарника, если был) успешно аннулированы.")
+            await log_admin(message.from_user.id, f"Принудительно сбросил трейд для {uid}")
+            
+        if not reset_performed:
+            # На всякий случай подчищаем, даже если нет в сетах, но вдруг есть скрытая сессия
+            active_trades_users.discard(uid)
+            active_combats.discard(uid)
+            await message.answer("ℹ️ Игрок не находился в активном поиске боя или трейде. Системные флаги принудительно очищены.")
+            
     except ValueError:
         await message.answer("❌ ID должен быть числом.")
     await state.clear()
@@ -2580,7 +2689,8 @@ async def adm_lb_main(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🎖 10-20 Места", callback_data="lb_edit_10_20")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
-    await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите позицию для редактирования наград (выдаются каждые 3 дня):", reply_markup=kb)
+    # Текст изменен на 2 дня
+    await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите позицию для редактирования наград (выдаются каждые 2 дня):", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("lb_edit_"))
 async def adm_lb_edit(callback: types.CallbackQuery, state: FSMContext):
@@ -2820,7 +2930,7 @@ async def main():
     ]
     await bot.set_my_commands(commands)
     
-    logging.info("🤖 Карточный бот запущен (Версия с трейдами и Ruby-рангами)!")
+    logging.info("🤖 Карточный бот запущен (Версия с защищенными трейдами и Ruby-рангами)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
