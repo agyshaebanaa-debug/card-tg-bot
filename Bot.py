@@ -1688,7 +1688,7 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     
     if diff_type == "easy":
         power_mult = 0.7  
-        trophies_scale = 0.6  # -40% Кубков (раньше было 0.5)
+        trophies_scale = 0.6  
         diff_name = "Лёгкий"
     elif diff_type == "med":
         power_mult = 1.1  
@@ -1696,7 +1696,7 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
         diff_name = "Средний"
     elif diff_type == "hard":
         power_mult = 1.6  
-        trophies_scale = 1.25 # +25% Кубков (раньше было 1.5)
+        trophies_scale = 1.25 
         diff_name = "Сложный"
         
     await callback.message.edit_text(f"⚔️ Ищем бота... Сложность: <b>{diff_name}</b>")
@@ -1886,7 +1886,7 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     active_combats.discard(p2_id)
 
 # ========================================================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА
+# ПАНЕЛЬ АДМИНИСТРАТОРА И БЭКАП БАЗЫ
 # ========================================================================
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -1952,7 +1952,7 @@ async def cq_adm_del_msg(message: types.Message, state: FSMContext):
 async def cq_adm_cards(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать", callback_data="adm_card_add"), InlineKeyboardButton(text="✏️ Редактировать", callback_data="adm_card_edit_list")],
-        [InlineKeyboardButton(text="🗑 Удалить", callback_data="adm_card_del")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data="adm_card_del_list")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
     await callback.message.edit_text("🃏 <b>Управление Картами</b>", reply_markup=kb)
@@ -2067,319 +2067,184 @@ async def adm_card_edit_start(callback: types.CallbackQuery, state: FSMContext):
     items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"} for c in cards]
     await state.update_data(adm_edit_items=items)
     
-    kb = get_pagination_keyboard(items, 0, "adm_ed_c", columns=1, items_per_page=8)
-    await callback.message.edit_text("👇 Выберите карту для редактирования:", reply_markup=kb)
+    kb = get_pagination_keyboard(items, 0, "adm_edit_c", columns=1, items_per_page=10)
+    await callback.message.edit_text("✏️ Выбери карту для редактирования:", reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("adm_ed_c_page_"))
-async def adm_card_edit_paginate(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data.startswith("adm_edit_c_page_"))
+async def adm_card_edit_page(callback: types.CallbackQuery, state: FSMContext):
     page = int(callback.data.split("_")[4])
     data = await state.get_data()
-    kb = get_pagination_keyboard(data.get('adm_edit_items', []), page, "adm_ed_c", columns=1, items_per_page=8)
+    kb = get_pagination_keyboard(data.get('adm_edit_items', []), page, "adm_edit_c", columns=1, items_per_page=10)
     await callback.message.edit_reply_markup(reply_markup=kb)
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("adm_ed_c_"))
+@dp.callback_query(F.data.startswith("adm_edit_c_"))
 async def adm_card_edit_select(callback: types.CallbackQuery, state: FSMContext):
     if "page" in callback.data: return
-    c_id = int(callback.data.split("_")[3])
+    card_id = int(callback.data.split("_")[3])
+    await state.update_data(edit_card_id=card_id)
+    card = await fetch_one("SELECT * FROM cards WHERE id=?", (card_id,))
     
-    card = await fetch_one("SELECT * FROM cards WHERE id = ?", (c_id,))
-    if not card: return await callback.answer("❌ Карта не найдена.")
+    if not card: return await callback.answer("Карта не найдена!", show_alert=True)
     
-    await state.update_data(edit_id=c_id)
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✏️ Имя", callback_data="edit_val_name"), InlineKeyboardButton(text="✏️ Шанс (Вес)", callback_data="edit_val_chance")],
-        [InlineKeyboardButton(text="✏️ Урон", callback_data="edit_val_dmg"), InlineKeyboardButton(text="✏️ ХП", callback_data="edit_val_hp")],
-        [InlineKeyboardButton(text="✏️ Буст Урон", callback_data="edit_val_bdmg"), InlineKeyboardButton(text="✏️ Буст ХП", callback_data="edit_val_bhp")],
-        [InlineKeyboardButton(text="✏️ Класс", callback_data="edit_val_class")]
+        [InlineKeyboardButton(text="Изменить Урон", callback_data="edc_damage"), InlineKeyboardButton(text="Изменить ХП", callback_data="edc_hp")],
+        [InlineKeyboardButton(text="Изменить Шанс", callback_data="edc_drop_chance")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_card_edit_list")]
     ])
-    await callback.message.edit_text(f"Редактирование <b>{card['name']}</b> (ID: {c_id})\nЧто меняем?", reply_markup=kb)
+    await callback.message.edit_text(f"✏️ Редактирование: <b>{card['name']}</b>\nВыберите параметр для изменения:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edc_"))
+async def adm_card_edit_field(callback: types.CallbackQuery, state: FSMContext):
+    field = callback.data.split("_")[1]
+    if field == "drop": field = "drop_chance"
+    await state.update_data(edit_field=field)
+    await callback.message.answer(f"Введите новое значение для поля <b>{field}</b>:")
     await state.set_state(EditCard.waiting_new_value)
     await callback.answer()
 
-@dp.callback_query(EditCard.waiting_new_value, F.data.startswith("edit_val_"))
-async def adm_card_edit_field(callback: types.CallbackQuery, state: FSMContext):
-    field = callback.data.split("_")[2]
-    await state.update_data(edit_field=field)
-    
-    if field == "class":
-        kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text=c)] for c in CLASSES], resize_keyboard=True)
-        await callback.message.answer("Выберите новый класс с клавиатуры:", reply_markup=kb)
-    else:
-        await callback.message.answer(f"Отправь новое значение для параметра {field}:")
-    await callback.answer()
-
 @dp.message(EditCard.waiting_new_value)
-async def adm_card_edit_save(message: types.Message, state: FSMContext):
+async def adm_card_edit_value(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    c_id = data['edit_id']
-    field = data['edit_field']
     val = message.text
-    
-    col_map = {
-        "name": ("name", str), "chance": ("drop_chance", float),
-        "dmg": ("damage", int), "hp": ("hp", int),
-        "bdmg": ("booster_dmg_mult", float), "bhp": ("booster_hp_mult", float),
-        "class": ("class_type", str)
-    }
-    
-    col, cast_fn = col_map[field]
     try:
-        if field == "class" and val not in CLASSES:
-            return await message.answer("Неверный класс. Используйте клавиатуру.")
-            
-        val = cast_fn(val.replace(',', '.')) if cast_fn == float else cast_fn(val)
-        await execute_db(f"UPDATE cards SET {col} = ? WHERE id = ?", (val, c_id))
-        await log_admin(message.from_user.id, f"Edited card ID {c_id}, {col} = {val}")
+        if data['edit_field'] in ['damage', 'hp']: val = int(val)
+        elif data['edit_field'] == 'drop_chance': val = float(val)
         
-        reply = "✅ Изменено!"
-        if field == "class": reply += " Возвращена стандартная клавиатура."
-        await message.answer(reply, reply_markup=get_main_keyboard(True))
-        await state.clear()
-    except: await message.answer("❌ Неверный формат значения.")
-
-@dp.callback_query(F.data == "adm_card_del")
-async def adm_card_del_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введи ID карты для удаления:")
-    await state.set_state("waiting_del_id")
-    await callback.answer()
-
-@dp.message(StateFilter("waiting_del_id"))
-async def adm_card_del_finish(message: types.Message, state: FSMContext):
-    try:
-        c_id = int(message.text)
-        await execute_db("DELETE FROM cards WHERE id = ?", (c_id,))
-        await execute_db("DELETE FROM inventory WHERE card_id = ?", (c_id,))
-        for slot in ['equip1', 'equip2', 'equip3', 'equip4']:
-            await execute_db(f"UPDATE users SET {slot} = 0 WHERE {slot} = ?", (c_id,))
-        await log_admin(message.from_user.id, f"DELETED card ID {c_id}")
-        await message.answer(f"✅ Карта {c_id} полностью удалена.")
-    except: await message.answer("❌ Число.")
+        await execute_db(f"UPDATE cards SET {data['edit_field']} = ? WHERE id = ?", (val, data['edit_card_id']))
+        await message.answer(f"✅ Поле <b>{data['edit_field']}</b> успешно обновлено на {val}!")
+    except:
+        await message.answer("❌ Ошибка ввода числа.")
     await state.clear()
 
+@dp.callback_query(F.data == "adm_card_del_list")
+async def adm_card_del_start(callback: types.CallbackQuery, state: FSMContext):
+    cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    if not cards: return await callback.answer("В базе нет карт!", show_alert=True)
+    
+    items = [{"id": c['id'], "btn_text": f"🗑 {c['name']} (ID:{c['id']})"} for c in cards]
+    await state.update_data(adm_del_items=items)
+    
+    kb = get_pagination_keyboard(items, 0, "adm_del_c", columns=1, items_per_page=10)
+    await callback.message.edit_text("🗑 Выбери карту для удаления (УДАЛИТСЯ ИЗ БАЗЫ И У ВСЕХ ИГРОКОВ!):", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_del_c_page_"))
+async def adm_card_del_page(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[4])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('adm_del_items', []), page, "adm_del_c", columns=1, items_per_page=10)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("adm_del_c_"))
+async def adm_card_del_select(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[3])
+    await execute_db("DELETE FROM cards WHERE id=?", (card_id,))
+    await execute_db("DELETE FROM inventory WHERE card_id=?", (card_id,))
+    await execute_db("DELETE FROM donate_shop WHERE card_id=?", (card_id,))
+    await callback.message.edit_text("✅ Карта успешно удалена отовсюду!")
+    await callback.answer()
+
+# --- Пользователи, Ивенты и Награды (Заглушки и реализация) ---
 @dp.callback_query(F.data == "adm_users")
-async def cq_adm_users(callback: types.CallbackQuery):
+async def adm_users_menu(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎁 Выдать карту", callback_data="adm_usr_givecard")],
-        [InlineKeyboardButton(text="💰 Выдать шекели", callback_data="adm_usr_give_coins"),
-         InlineKeyboardButton(text="🏆 Выдать кубки", callback_data="adm_usr_give_trophies")],
-        [InlineKeyboardButton(text="🔄 Сбросить бой", callback_data="adm_usr_reset_battle")],
-        [InlineKeyboardButton(text="🔨 Бан / Разбан", callback_data="adm_usr_ban")],
+        [InlineKeyboardButton(text="💰 Дать Шекели", callback_data="adm_give_coins"), InlineKeyboardButton(text="🏆 Дать Кубки", callback_data="adm_give_trophies")],
+        [InlineKeyboardButton(text="🃏 Выдать карту", callback_data="adm_give_card"), InlineKeyboardButton(text="🔨 Бан/Разбан", callback_data="adm_ban_user")],
+        [InlineKeyboardButton(text="🔄 Сброс боя (Развисание)", callback_data="adm_reset_battle")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
     await callback.message.edit_text("👤 <b>Управление Игроками</b>", reply_markup=kb)
 
-@dp.callback_query(F.data == "adm_usr_give_coins")
-async def adm_usr_give_coins_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для выдачи шекелей:")
-    await state.set_state(AdminManage.give_coins_id)
-    await callback.answer()
-
-@dp.message(AdminManage.give_coins_id)
-async def adm_usr_give_coins_id(message: types.Message, state: FSMContext):
-    try:
-        uid = int(message.text)
-        await state.update_data(target_id=uid)
-        await message.answer("Сколько шекелей выдать?")
-        await state.set_state(AdminManage.give_coins_amount)
-    except ValueError:
-        await message.answer("❌ ID должен быть числом.")
-
-@dp.message(AdminManage.give_coins_amount)
-async def adm_usr_give_coins_amount(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        data = await state.get_data()
-        uid = data['target_id']
-        await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (amount, uid))
-        await log_admin(message.from_user.id, f"Выдал {amount} шекелей игроку {uid}")
-        await message.answer(f"✅ Успешно выдано {amount} шекелей игроку {uid}.")
-        try:
-            await bot.send_message(uid, f"🎁 Администратор выдал вам <b>{amount} 💰 Шекелей</b>!")
-        except:
-            pass
-    except ValueError:
-        await message.answer("❌ Сумма должна быть числом.")
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_usr_give_trophies")
-async def adm_usr_give_trophies_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для выдачи кубков:")
-    await state.set_state(AdminManage.give_trophies_id)
-    await callback.answer()
-
-@dp.message(AdminManage.give_trophies_id)
-async def adm_usr_give_trophies_id(message: types.Message, state: FSMContext):
-    try:
-        uid = int(message.text)
-        await state.update_data(target_id=uid)
-        await message.answer("Сколько кубков выдать?")
-        await state.set_state(AdminManage.give_trophies_amount)
-    except ValueError:
-        await message.answer("❌ ID должен быть числом.")
-
-@dp.message(AdminManage.give_trophies_amount)
-async def adm_usr_give_trophies_amount(message: types.Message, state: FSMContext):
-    try:
-        amount = int(message.text)
-        data = await state.get_data()
-        uid = data['target_id']
-        await execute_db("UPDATE users SET trophies = trophies + ? WHERE id = ?", (amount, uid))
-        await log_admin(message.from_user.id, f"Выдал {amount} кубков игроку {uid}")
-        await message.answer(f"✅ Успешно выдано {amount} кубков игроку {uid}.")
-    except ValueError:
-        await message.answer("❌ Сумма должна быть числом.")
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_usr_givecard")
-async def adm_usr_givecard_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока кому выдать карту:")
-    await state.set_state(GiveCard.user_id)
-    await callback.answer()
-
-@dp.message(GiveCard.user_id)
-async def adm_usr_givecard_user(message: types.Message, state: FSMContext):
-    try:
-        await state.update_data(target_id=int(message.text))
-        await message.answer("Введите ID карты для выдачи:")
-        await state.set_state(GiveCard.card_id)
-    except: await message.answer("❌ ID должен быть числом.")
-
-@dp.message(GiveCard.card_id)
-async def adm_usr_givecard_card(message: types.Message, state: FSMContext):
-    try:
-        await state.update_data(card_id=int(message.text))
-        kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Normal"), KeyboardButton(text="Gold"), KeyboardButton(text="Rainbow")]], resize_keyboard=True)
-        await message.answer("Выберите мутацию:", reply_markup=kb)
-        await state.set_state(GiveCard.mutation)
-    except: await message.answer("❌ ID должен быть числом.")
-
-@dp.message(GiveCard.mutation)
-async def adm_usr_givecard_mut(message: types.Message, state: FSMContext):
-    if message.text not in ["Normal", "Gold", "Rainbow"]: return await message.answer("С клавиатуры.")
-    data = await state.get_data()
-    uid = data['target_id']
-    cid = data['card_id']
-    mut = message.text
-    
-    card = await fetch_one("SELECT name, rarity FROM cards WHERE id = ?", (cid,))
-    if not card: return await message.answer("❌ Карта не найдена.", reply_markup=get_main_keyboard(True))
-    
-    _, serial, _ = await give_card_to_user(uid, cid, mut, card['rarity'])
-    await log_admin(message.from_user.id, f"Выдал карту ID {cid} юзеру {uid}")
-    await message.answer(f"✅ Выдана {card['name']} юзеру {uid}!", reply_markup=get_main_keyboard(True))
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_usr_reset_battle")
-async def adm_usr_reset_battle_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для сброса боя:")
+@dp.callback_query(F.data == "adm_reset_battle")
+async def adm_reset_battle_handler(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите ID игрока, чтобы вывести его из багающего боя:")
     await state.set_state(AdminManage.reset_battle_id)
     await callback.answer()
 
 @dp.message(AdminManage.reset_battle_id)
-async def adm_usr_reset_battle_finish(message: types.Message, state: FSMContext):
+async def adm_reset_battle_msg(message: types.Message, state: FSMContext):
     try:
         uid = int(message.text)
         active_combats.discard(uid)
-        await log_admin(message.from_user.id, f"Сбросил состояние боя юзеру {uid}")
-        await message.answer(f"✅ Бой для игрока {uid} сброшен.")
-    except: await message.answer("❌ ID должен быть числом.")
+        await message.answer(f"✅ Статус боя для игрока {uid} был сброшен.")
+    except: await message.answer("❌ Должно быть числом.")
     await state.clear()
 
-@dp.callback_query(F.data == "adm_usr_ban")
-async def adm_usr_ban_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID игрока для бана/разбана:")
-    await state.set_state(AdminBan.user_id)
-    await callback.answer()
+@dp.callback_query(F.data == "adm_events")
+async def cq_adm_events(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🍀 Ивент Удачи", callback_data="adm_ev_luck"), InlineKeyboardButton(text="⏳ Ивент КД", callback_data="adm_ev_cd")],
+        [InlineKeyboardButton(text="📢 Рассылка", callback_data="adm_announce")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
+    ])
+    await callback.message.edit_text("🎉 <b>Ивенты и Рассылки</b>", reply_markup=kb)
 
-@dp.message(AdminBan.user_id)
-async def adm_usr_ban_finish(message: types.Message, state: FSMContext):
-    try:
-        uid = int(message.text)
-        if uid == SUPER_ADMIN_ID: return await message.answer("❌ Нельзя банить создателя.")
-        user = await fetch_one("SELECT banned FROM users WHERE id = ?", (uid,))
-        if not user: return await message.answer("❌ Юзер не найден.")
-        
-        new_status = 0 if user['banned'] else 1
-        await execute_db("UPDATE users SET banned = ? WHERE id = ?", (new_status, uid))
-        action = "забанен" if new_status else "разбанен"
-        await log_admin(message.from_user.id, f"{action.upper()} юзера {uid}")
-        await message.answer(f"✅ Пользователь {uid} {action}.")
-    except: await message.answer("❌ ID должен быть числом.")
-    await state.clear()
+@dp.callback_query(F.data == "adm_lb_main")
+async def cq_adm_lb(callback: types.CallbackQuery):
+    await callback.message.edit_text("🏆 <b>Настройка наград Лидерборда</b>\nВ разработке/Используйте БД напрямую.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]]))
 
 @dp.callback_query(F.data == "adm_donate_shop")
 async def cq_adm_donate(callback: types.CallbackQuery):
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить юнита", callback_data="adm_don_add"),
-         InlineKeyboardButton(text="➖ Удалить юнита", callback_data="adm_don_del")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
-    ])
-    await callback.message.edit_text("💎 <b>Управление Донат Магазином</b>", reply_markup=kb)
+    await callback.message.edit_text("💎 <b>Настройка Донат Магазина</b>\nВ разработке/Используйте БД напрямую.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]]))
 
-@dp.callback_query(F.data == "adm_don_add")
-async def adm_don_add_start(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("Введите ID карты для добавления в донат-магазин:")
-    await state.set_state(AdminDonateAdd.card_id)
-    await callback.answer()
-
-@dp.message(AdminDonateAdd.card_id)
-async def adm_don_add_cid(message: types.Message, state: FSMContext):
-    try:
-        cid = int(message.text)
-        card = await fetch_one("SELECT * FROM cards WHERE id = ?", (cid,))
-        if not card: return await message.answer("❌ Карта не найдена.")
-        await state.update_data(card_id=cid)
-        await message.answer(f"Карта: {card['name']}. Введите цену в Робуксах:")
-        await state.set_state(AdminDonateAdd.price)
-    except: await message.answer("❌ Должно быть числом.")
-
-@dp.message(AdminDonateAdd.price)
-async def adm_don_add_price(message: types.Message, state: FSMContext):
-    try:
-        price = int(message.text)
-        data = await state.get_data()
-        await execute_db("INSERT INTO donate_shop (card_id, price_robux) VALUES (?, ?)", (data['card_id'], price))
-        await log_admin(message.from_user.id, f"Добавлен юнит ID {data['card_id']} в Донат Магазин за {price} Робуксов")
-        await message.answer("✅ Карта успешно выставлена в Донат-Магазин!")
-    except: await message.answer("❌ Должно быть числом.")
-    await state.clear()
-
-@dp.callback_query(F.data == "adm_don_del")
-async def adm_don_del_start(callback: types.CallbackQuery, state: FSMContext):
-    items = await fetch_all("SELECT d.id, c.name FROM donate_shop d JOIN cards c ON d.card_id = c.id")
-    if not items: return await callback.answer("Магазин пуст", show_alert=True)
-    text = "Введите ID позиции для удаления:\n"
-    for i in items:
-        text += f"ID: {i['id']} - {i['name']}\n"
-    await callback.message.answer(text)
-    await state.set_state("waiting_don_del_id")
-    await callback.answer()
-
-@dp.message(StateFilter("waiting_don_del_id"))
-async def adm_don_del_finish(message: types.Message, state: FSMContext):
-    try:
-        don_id = int(message.text)
-        await execute_db("DELETE FROM donate_shop WHERE id = ?", (don_id,))
-        await message.answer("✅ Успешно удалено из донат-магазина.")
-    except: await message.answer("❌ Ошибка.")
-    await state.clear()
-
+# --- БЭКАП БАЗЫ ДАННЫХ И ВОЗВРАТ ---
 @dp.callback_query(F.data == "adm_db")
-async def adm_db_backup(callback: types.CallbackQuery):
-    try:
-        await callback.message.answer_document(FSInputFile(DB_NAME), caption="📦 Бэкап базы данных.")
-        await log_admin(callback.from_user.id, "Скачал бэкап базы данных")
-    except Exception as e:
-        await callback.answer(f"Ошибка: {e}", show_alert=True)
-    await callback.answer()
+async def cq_adm_db(callback: types.CallbackQuery):
+    if not await is_admin(callback.from_user.id): return
+    if os.path.exists(DB_NAME):
+        doc = FSInputFile(DB_NAME)
+        await bot.send_document(
+            callback.from_user.id, 
+            doc, 
+            caption="📦 <b>Бэкап базы данных</b>\nОтправьте мне файл базы данных (с расширением .db или .sqlite) в ответ, чтобы восстановить и заменить текущую базу!"
+        )
+        await callback.answer()
+    else:
+        await callback.answer("❌ Файл базы данных не найден!", show_alert=True)
 
+@dp.message(F.document)
+async def handle_db_document(message: types.Message):
+    if not await is_admin(message.from_user.id): return
+    doc = message.document
+    if doc.file_name.endswith('.db') or doc.file_name.endswith('.sqlite'):
+        msg = await message.answer("⏳ <b>Скачиваю новую базу данных...</b>")
+        try:
+            temp_file = "temp_" + doc.file_name
+            await bot.download(doc, destination=temp_file)
+            
+            # Делаем бекап старой
+            if os.path.exists(DB_NAME):
+                try: os.replace(DB_NAME, DB_NAME + ".bak")
+                except: pass
+                
+            # Заменяем на новую
+            os.rename(temp_file, DB_NAME)
+            
+            await msg.edit_text("✅ <b>База данных успешно обновлена и заменена!</b>\nСтарая база сохранена как .bak на сервере.\nРекомендуется перезапустить бота, чтобы все настройки применились корректно.")
+            await log_admin(message.from_user.id, f"Загрузил новую базу данных из файла {doc.file_name}")
+        except Exception as e:
+            await msg.edit_text(f"❌ Ошибка при загрузке БД: {e}")
+    else:
+        await message.answer("❌ Пожалуйста, отправьте файл с расширением `.db` или `.sqlite`.")
+
+# ========================================================================
+# ЗАПУСК БОТА (MAIN)
+# ========================================================================
 async def main():
+    # Проверка схемы базы данных
     await check_and_update_schema()
+    
+    # Запуск фоновых задач
     asyncio.create_task(shop_auto_restock_task())
     asyncio.create_task(leaderboard_rewards_task())
-    logging.info("Bot is starting polling...")
+    
+    logging.info("Бот запущен. Начинаю пуллинг...")
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
