@@ -78,6 +78,19 @@ CLASS_EMOJI = {
 
 CLASSES = list(CLASS_EMOJI.keys())
 
+# Веса для сортировки (чем больше число, тем выше в списке)
+RARITY_WEIGHT = {
+    "Leaderboard": 9, 
+    "Exclusive": 8, 
+    "Super": 7, 
+    "Mythic": 6, 
+    "Legendary": 5, 
+    "Epic": 4, 
+    "Rare": 3, 
+    "Uncommon": 2, 
+    "Basic": 1
+}
+
 active_combats = set()
 active_trades = {}  # trade_id -> trade_dict
 user_trades = {}    # user_id -> trade_id
@@ -379,6 +392,16 @@ def get_display_name(user_data: dict) -> str:
     elif user_data.get('first_name'): return user_data['first_name']
     return f"Игрок {user_data.get('id', '???')}"
 
+async def get_user_titles_str(user_id: int) -> str:
+    """Генерирует строку с титулами пользователя (если есть)"""
+    titles = []
+    if await is_admin(user_id): titles.append("Администратор")
+    if await is_signer(user_id): titles.append("Подписывающий")
+    
+    if titles:
+        return f" [<i>{', '.join(titles)}</i>]"
+    return ""
+
 def make_progress_bar(current, total, length=10):
     if total <= 0: return "🟩" * length
     pct = min(1.0, current / total)
@@ -458,7 +481,7 @@ def get_main_keyboard(is_adm: bool = False, is_sgn: bool = False):
         [KeyboardButton(text="🎴 Выбить карту"), KeyboardButton(text="⚔️ Поиск боя (боты)")],
         [KeyboardButton(text="🎒 Инвентарь"), KeyboardButton(text="🛡 Экипировка")],
         [KeyboardButton(text="🛒 Магазин"), KeyboardButton(text="📜 Квесты")],
-        [KeyboardButton(text="⚔️ PvP Дуэль"), KeyboardButton(text="🤝 Обмен карт")],
+        [KeyboardButton(text="⚔️ PvP Дуэль"), KeyboardButton(text="🤝 Трейд")],
         [KeyboardButton(text="🎟 Батл-пассы"), KeyboardButton(text="🏆 Топ игроков")],
         [KeyboardButton(text="👤 Профиль"), KeyboardButton(text="📖 Индекс")]
     ]
@@ -580,14 +603,27 @@ async def create_bordered_image(bot: Bot, photo_id: str, rarity: str) -> str:
     return msg.photo[-1].file_id
 
 def format_card_name(c):
-    r_em = RARITY_EMOJI.get(c['rarity'], "⚪")
-    c_em = CLASS_EMOJI.get(c['class_type'], "🎯")
+    """Возвращает название карты с HTML форматированием (подходит для текста сообщений)"""
+    r_em = RARITY_EMOJI.get(c.get('rarity', 'Basic'), "⚪")
+    c_em = CLASS_EMOJI.get(c.get('class_type', 'Single'), "🎯")
     name = f"{r_em} {c_em} <b>{c['name']}</b>"
     if c.get('serial_number', 0) > 0:
         name += f" <b>[#{c['serial_number']:04d}]</b>"
-    if c.get('signed_by'):
+    if c.get('signed_by', 0) > 0:
         signer_name = c.get('signer_name') or f"ID:{c['signed_by']}"
-        name += f" <i>(✍️ {signer_name})</i>"
+        name += f" <i>(✍️ Sign: {signer_name})</i>"
+    return name
+
+def format_card_name_plain(c):
+    """Возвращает название карты БЕЗ HTML (подходит для текста в инлайн-кнопках)"""
+    r_em = RARITY_EMOJI.get(c.get('rarity', 'Basic'), "⚪")
+    c_em = CLASS_EMOJI.get(c.get('class_type', 'Single'), "🎯")
+    name = f"{r_em} {c_em} {c['name']}"
+    if c.get('serial_number', 0) > 0:
+        name += f" [#{c['serial_number']:04d}]"
+    if c.get('signed_by', 0) > 0:
+        signer_name = c.get('signer_name') or f"ID:{c['signed_by']}"
+        name += f" (✍️ Sign: {signer_name})"
     return name
 
 def format_rarity_display(rarity):
@@ -794,6 +830,7 @@ async def cmd_profile(message: types.Message):
     rank = await get_user_rank(user['trophies'])
     total_cards = await fetch_one("SELECT SUM(count) as s FROM inventory WHERE user_id = ?", (user['id'],))
     name = get_display_name(user)
+    title_str = await get_user_titles_str(user['id'])
     
     active_bp = await fetch_one("""
         SELECT bp.title, ubp.level, ubp.xp 
@@ -806,7 +843,7 @@ async def cmd_profile(message: types.Message):
         bp_text = f"<b>{active_bp['title']}</b> (Ур. {active_bp['level']} | {active_bp['xp']} XP)"
 
     text = (
-        f"👤 <b>Профиль игрока {name}</b>\n"
+        f"👤 <b>Профиль игрока {name}</b>{title_str}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"🎖 <b>Ранг:</b> {rank['name']}\n"
         f"🏆 <b>Кубки:</b> {user['trophies']}\n"
@@ -822,16 +859,37 @@ async def cmd_profile(message: types.Message):
     
     for i, slot in enumerate(['equip1', 'equip2', 'equip3'], 1):
         if user[slot] != 0:
-            card = await fetch_one("SELECT name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards WHERE id = ?", (user[slot],))
+            card = await fetch_one("SELECT id, name, rarity, class_type, damage, hp, booster_dmg_mult, booster_hp_mult FROM cards WHERE id = ?", (user[slot],))
             if card:
-                invs = await fetch_all("SELECT mutation FROM inventory WHERE user_id = ? AND card_id = ?", (user['id'], user[slot]))
+                invs = await fetch_all("SELECT mutation, serial_number, signed_by FROM inventory WHERE user_id = ? AND card_id = ?", (user['id'], user[slot]))
                 muts = [item['mutation'] for item in invs]
+                
+                best_mut = "Normal"
+                if "Rainbow" in muts: best_mut = "Rainbow"
+                elif "Gold" in muts: best_mut = "Gold"
+                
                 mult = 1.0
                 mut_str = ""
-                if "Rainbow" in muts: mult = 1.2; mut_str = " 🌈"
-                elif "Gold" in muts: mult = 1.1; mut_str = " ⭐"
+                if best_mut == "Rainbow": mult = 1.2; mut_str = " 🌈"
+                elif best_mut == "Gold": mult = 1.1; mut_str = " ⭐"
                 
-                n = format_card_name(card)
+                best_serial = 0
+                best_signed = 0
+                for item in invs:
+                    if item['mutation'] == best_mut:
+                        if item['serial_number'] > 0: best_serial = item['serial_number']
+                        if item['signed_by'] > 0: best_signed = item['signed_by']
+                        
+                c_dict = dict(card)
+                c_dict['serial_number'] = best_serial
+                c_dict['signed_by'] = best_signed
+                
+                if best_signed > 0:
+                    signer = await fetch_one("SELECT username, first_name FROM users WHERE id = ?", (best_signed,))
+                    if signer:
+                        c_dict['signer_name'] = get_display_name(signer)
+                
+                n = format_card_name(c_dict)
                 if card['class_type'] == 'Booster': 
                     text += f" {i}️⃣ {n}{mut_str}\n      └ <i>Бафф: DMG x{round(card['booster_dmg_mult']*mult, 2)} | HP x{round(card['booster_hp_mult']*mult, 2)}</i>\n"
                 else: 
@@ -881,9 +939,10 @@ async def cmd_top(message: types.Message):
     text = "🏆 <b>МИРОВОЙ РЕЙТИНГ (Топ-20)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for i, u in enumerate(top_users, 1):
         name = get_display_name(u)
+        title_str = await get_user_titles_str(u['id'])
         rank = await get_user_rank(u['trophies'])
         med = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🏅"
-        text += f"{med} <b>{i}. {name}</b> — {u['trophies']} 🏆 <i>({rank['name']})</i>\n"
+        text += f"{med} <b>{i}. {name}</b>{title_str} — {u['trophies']} 🏆 <i>({rank['name']})</i>\n"
         
     text += "\n🎁 <b>Награды Сезона (сброс каждые 2 дня):</b>\n"
     brackets = ["1", "2", "3", "4_9", "10_20"]
@@ -1165,14 +1224,13 @@ async def get_inventory_text_and_kb(user_id: int, page: int = 0, items_per_page:
     
     if not inv: return "🎒 Ваш инвентарь пуст. Используйте /getcard", None
         
-    rarity_weight = {"Leaderboard": 9, "Exclusive": 8, "Super": 7, "Mythic": 6, "Legendary": 5, "Epic": 4, "Rare": 3, "Uncommon": 2, "Basic": 1}
     mutation_weight = {"Rainbow": 3, "Gold": 2, "Normal": 1}
     
     for item in inv:
         if item['signed_by'] != 0:
             item['signer_name'] = get_display_name({'username': item['username'], 'first_name': item['first_name']})
     
-    inv.sort(key=lambda x: (x['signed_by'] > 0, rarity_weight.get(x['rarity'], 0), mutation_weight.get(x['mutation'], 0), x['card_id']), reverse=True)
+    inv.sort(key=lambda x: (x['signed_by'] > 0, RARITY_WEIGHT.get(x['rarity'], 0), mutation_weight.get(x['mutation'], 0), x['card_id']), reverse=True)
     
     total_pages = max(1, math.ceil(len(inv) / items_per_page))
     page = max(0, min(page, total_pages - 1))
@@ -1228,6 +1286,7 @@ async def cmd_sign_card(message: types.Message):
     
     if not inv: return await message.answer("❌ В инвентаре нет карт, доступных для подписи (или все уже подписаны).")
     
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
     items = [{"id": c['inv_id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} x{c['count']}"} for c in inv]
     kb = get_pagination_keyboard(items, 0, "sgn_c", columns=1, items_per_page=8)
     await message.answer("✍️ <b>ВЫБОР КАРТЫ ДЛЯ ПОДПИСИ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите карту из инвентаря, чтобы оставить на ней свою роспись:", reply_markup=kb)
@@ -1239,6 +1298,7 @@ async def cb_sign_card_paginate(callback: types.CallbackQuery):
         SELECT c.id as card_id, c.name, c.rarity, c.class_type, i.id as inv_id, i.count, i.mutation, i.serial_number, i.signed_by
         FROM inventory i JOIN cards c ON i.card_id = c.id WHERE i.user_id = ? AND i.count > 0 AND i.signed_by = 0
     """, (callback.from_user.id,))
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
     items = [{"id": c['inv_id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} x{c['count']}"} for c in inv]
     kb = get_pagination_keyboard(items, page, "sgn_c", columns=1, items_per_page=8)
     try: await callback.message.edit_reply_markup(reply_markup=kb)
@@ -1328,6 +1388,7 @@ async def equip_slot_callback(callback: types.CallbackQuery, state: FSMContext):
     """, (callback.from_user.id,))
     if not inv: return await callback.answer("У вас нет карт!", show_alert=True)
     
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
     items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']}"} for c in inv]
     await state.update_data(equip_slot=slot_num, equip_items=items)
     kb = get_pagination_keyboard(items, 0, "eq_set", columns=1, items_per_page=8)
@@ -1591,6 +1652,10 @@ async def get_team_data(user_id: int):
                 card['mutation'] = mut_type
                 card['serial_number'] = best_serial
                 card['signed_by'] = best_signed
+                if best_signed > 0:
+                    signer_info = await fetch_one("SELECT username, first_name FROM users WHERE id = ?", (best_signed,))
+                    card['signer_name'] = get_display_name(signer_info) if signer_info else f"ID:{best_signed}"
+
                 card['max_hp'] = card['hp']
                 card['burn'] = 0     
                 card['dmg_buff'] = 0 
@@ -1696,8 +1761,13 @@ def format_combat_team_vertical(team):
         if c.get('burn', 0) > 0: status += "🔥"
         if c.get('dmg_buff', 0) > 0: status += "✨"
         if c['class_type'] == 'Booster': status += "🔋"
+        
         s_str = f" [#{c['serial_number']:04d}]" if c.get('serial_number', 0) > 0 else ""
-        sgn_str = " ✍️" if c.get('signed_by', 0) > 0 else ""
+        sgn_str = ""
+        if c.get('signed_by', 0) > 0:
+            s_name = c.get('signer_name') or f"ID:{c['signed_by']}"
+            sgn_str = f" ✍️ Sign: {s_name}"
+            
         dmg = c['damage'] + c.get('dmg_buff', 0)
         res.append(f"• {c['name']}{s_str}{sgn_str}{status} (⚔️{dmg} | ❤️{c['hp']}/{c['max_hp']})")
     return "\n".join(res)
@@ -1992,7 +2062,8 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     
     if not team2: return await callback.message.edit_text("❌ На сервере нет карт для генерации бота.")
         
-    p1_name = get_display_name(user)
+    title_str = await get_user_titles_str(callback.from_user.id)
+    p1_name = get_display_name(user) + title_str
     active_combats.add(callback.from_user.id)
     
     asyncio.create_task(run_battle_loop(bot, callback.message.chat.id, callback.from_user.id, p1_name, 0, f"ИИ ({diff_name})", team1, team2, trophies_scale, bp_xp_mult, is_pvp=False))
@@ -2034,6 +2105,7 @@ async def process_pvp_target(message: types.Message, state: FSMContext):
 
     challenger = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
     challenger_name = get_display_name(challenger)
+    title_str = await get_user_titles_str(message.from_user.id)
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -2045,7 +2117,7 @@ async def process_pvp_target(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(
             target_user['id'], 
-            f"⚔️ Игрок <b>{challenger_name}</b> вызывает вас на дружескую дуэль!\n\n<i>Для принятия вызова у вас должна быть собрана Боевая колода (в Экипировке).</i>",
+            f"⚔️ Игрок <b>{challenger_name}</b>{title_str} вызывает вас на дружескую дуэль!\n\n<i>Для принятия вызова у вас должна быть собрана Боевая колода (в Экипировке).</i>",
             reply_markup=kb
         )
         await message.answer(f"📨 Вызов успешно отправлен игроку {get_display_name(target_user)}. Ждем ответа...")
@@ -2072,8 +2144,10 @@ async def callback_pvp_accept(callback: types.CallbackQuery):
     challenger = await fetch_one("SELECT * FROM users WHERE id = ?", (challenger_id,))
     target = await fetch_one("SELECT * FROM users WHERE id = ?", (target_id,))
     
-    p1_name = get_display_name(challenger)
-    p2_name = get_display_name(target)
+    title_p1 = await get_user_titles_str(challenger_id)
+    title_p2 = await get_user_titles_str(target_id)
+    p1_name = get_display_name(challenger) + title_p1
+    p2_name = get_display_name(target) + title_p2
     
     active_combats.add(challenger_id)
     active_combats.add(target_id)
@@ -2171,14 +2245,13 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
 # ========================================================================
 # ТРЕЙДЫ (БЕЗОПАСНЫЙ ОБМЕН КАРТАМИ С ТРАНЗАКЦИЯМИ И ДВОЙНЫМ ПОДТВЕРЖДЕНИЕМ)
 # ========================================================================
-@dp.message(F.text == "🤝 Обмен карт")
+@dp.message(F.text == "🤝 Трейд")
 @dp.message(Command("trade"))
 async def cmd_trade_request(message: types.Message, state: FSMContext):
     if await check_ban(message.from_user.id): return
     if message.from_user.id in active_combats or message.from_user.id in user_trades:
         return await message.answer("❌ Вы уже находитесь в бою или обмене!")
         
-    # Если это команда с аргументом (например, /trade @username)
     parts = message.text.split()
     if len(parts) > 1:
         message.text = parts[1]
@@ -2211,7 +2284,8 @@ async def process_trade_target(message: types.Message, state: FSMContext):
         return await message.answer("❌ Игрок сейчас занят (в бою или уже торгуется)!")
 
     challenger = await fetch_one("SELECT * FROM users WHERE id = ?", (message.from_user.id,))
-    challenger_name = get_display_name(challenger)
+    title_str = await get_user_titles_str(message.from_user.id)
+    challenger_name = get_display_name(challenger) + title_str
     
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -2242,13 +2316,17 @@ async def callback_trade_accept(callback: types.CallbackQuery):
     p1 = await fetch_one("SELECT * FROM users WHERE id = ?", (p1_id,))
     p2 = await fetch_one("SELECT * FROM users WHERE id = ?", (p2_id,))
     
+    title_p1 = await get_user_titles_str(p1_id)
+    title_p2 = await get_user_titles_str(p2_id)
+    
     trade_id = f"tr_{p1_id}_{p2_id}_{int(time.time())}"
     trade = {
         'id': trade_id,
         'p1': p1_id, 'p2': p2_id,
-        'p1_name': get_display_name(p1), 'p2_name': get_display_name(p2),
-        'p1_offer': {}, 'p2_offer': {},  # inv_id -> qty
-        'p1_strings': {}, 'p2_strings': {}, # inv_id -> str
+        'p1_name': get_display_name(p1) + title_p1, 
+        'p2_name': get_display_name(p2) + title_p2,
+        'p1_offer': {}, 'p2_offer': {},  
+        'p1_strings': {}, 'p2_strings': {}, 
         'p1_ready': False, 'p2_ready': False,
         'p1_confirmed': False, 'p2_confirmed': False,
         'p1_msg': None, 'p2_msg': None,
@@ -2428,12 +2506,14 @@ async def cb_trade_menu_add(callback: types.CallbackQuery):
         WHERE i.user_id = ? AND i.count > 0
     """, (user_id,))
     
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
+    
     items = []
     for c in inv:
         avail = c['count'] - offer_dict.get(c['inv_id'], 0)
         if avail > 0:
             if c['signed_by'] != 0: c['signer_name'] = get_display_name({'username': c['username'], 'first_name': c['first_name']})
-            n = format_card_name(c).replace(" <b>[#-001]</b>", "")
+            n = format_card_name_plain(c)
             mut = "⭐ " if c['mutation'] == 'Gold' else ("🌈 " if c['mutation'] == 'Rainbow' else "")
             items.append({"id": c['inv_id'], "btn_text": f"{mut}{n} (Дост: {avail})"})
             
@@ -2458,12 +2538,14 @@ async def cb_trade_add_paginate(callback: types.CallbackQuery):
         WHERE i.user_id = ? AND i.count > 0
     """, (user_id,))
     
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
+    
     items = []
     for c in inv:
         avail = c['count'] - offer_dict.get(c['inv_id'], 0)
         if avail > 0:
             if c['signed_by'] != 0: c['signer_name'] = get_display_name({'username': c['username'], 'first_name': c['first_name']})
-            n = format_card_name(c).replace(" <b>[#-001]</b>", "")
+            n = format_card_name_plain(c)
             mut = "⭐ " if c['mutation'] == 'Gold' else ("🌈 " if c['mutation'] == 'Rainbow' else "")
             items.append({"id": c['inv_id'], "btn_text": f"{mut}{n} (Дост: {avail})"})
             
@@ -2492,13 +2574,14 @@ async def cb_trade_do_add(callback: types.CallbackQuery):
     if avail <= 0: return await callback.answer("Больше нет в наличии!", show_alert=True)
     
     offer_dict[inv_id] = offer_dict.get(inv_id, 0) + 1
-    mut = "⭐" if row['mutation'] == 'Gold' else ("🌈" if row['mutation'] == 'Rainbow' else "")
-    string_dict[inv_id] = f"{mut} {format_card_name(row).replace(' <b>[#-001]</b>', '')}"
+    mut = "⭐ " if row['mutation'] == 'Gold' else ("🌈 " if row['mutation'] == 'Rainbow' else "")
+    
+    string_dict[inv_id] = f"{mut}{format_card_name_plain(row)}"
     
     trade['p1_ready'] = False; trade['p2_ready'] = False
     trade['p1_confirmed'] = False; trade['p2_confirmed'] = False
     
-    await callback.answer(f"Добавлено: {string_dict[inv_id]}")
+    await callback.answer(f"Добавлено!")
     await update_trade_uis(trade)
 
 @dp.callback_query(F.data == "tr_menu_rem")
