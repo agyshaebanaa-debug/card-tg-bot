@@ -107,7 +107,7 @@ SHOP_PACKAGES = [
     ("rnd_sup", "Случайная Супер Карта", 80000, 1, 0.2) 
 ]
 
-# Словари для мультиязычных кнопок
+# Словари для мультиязычных кнопок (Заменен Трейд на Сид-Паки в главном меню)
 BTN_DRAW = ["🎴 Выбить карту", "🎴 Draw Card"]
 BTN_PVE = ["⚔️ Поиск боя (боты)", "⚔️ PvE Search"]
 BTN_PVP = ["⚔️ PvP Дуэль", "⚔️ PvP Duel"]
@@ -119,7 +119,7 @@ BTN_SHOP = ["🛒 Магазин", "🛒 Shop"]
 BTN_BP = ["🎟 Батл-пассы", "🎟 Battle Pass"]
 BTN_TOP = ["🏆 Топ игроков", "🏆 Leaderboard"]
 BTN_IDX = ["📖 Индекс", "📖 Index"]
-BTN_TRADE = ["🤝 Трейд", "🤝 Trade"]
+BTN_SEED_PACKS = ["📦 Сид-Паки", "📦 Seed-Packs"]
 BTN_SET = ["⚙️ Настройки", "⚙️ Settings"]
 BTN_SIGN = ["✍️ Подписать карту", "✍️ Sign Card"]
 BTN_ADM = ["⚙️ Админ-панель", "⚙️ Admin Panel"]
@@ -247,7 +247,11 @@ async def check_and_update_schema():
                 cd_mult REAL DEFAULT 1.0,
                 cd_end REAL DEFAULT 0,
                 last_restock REAL DEFAULT 0,
-                last_lb_reward REAL DEFAULT 0
+                last_lb_reward REAL DEFAULT 0,
+                coin_mult REAL DEFAULT 1.0,
+                coin_end REAL DEFAULT 0,
+                xp_mult REAL DEFAULT 1.0,
+                xp_end REAL DEFAULT 0
             )
         """)
         
@@ -255,6 +259,45 @@ async def check_and_update_schema():
         except aiosqlite.OperationalError: pass
         try: await db.execute("ALTER TABLE server_settings ADD COLUMN last_lb_reward REAL DEFAULT 0")
         except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE server_settings ADD COLUMN coin_mult REAL DEFAULT 1.0")
+        except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE server_settings ADD COLUMN coin_end REAL DEFAULT 0")
+        except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE server_settings ADD COLUMN xp_mult REAL DEFAULT 1.0")
+        except aiosqlite.OperationalError: pass
+        try: await db.execute("ALTER TABLE server_settings ADD COLUMN xp_end REAL DEFAULT 0")
+        except aiosqlite.OperationalError: pass
+
+        # ==========================================
+        # ТАБЛИЦЫ СИД-ПАКОВ
+        # ==========================================
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seed_packs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                photo_id TEXT,
+                description TEXT,
+                price INTEGER DEFAULT 2000
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS seed_pack_cards (
+                pack_id INTEGER,
+                card_id INTEGER,
+                drop_chance REAL,
+                PRIMARY KEY (pack_id, card_id)
+            )
+        """)
+        
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_seed_packs (
+                user_id INTEGER,
+                pack_id INTEGER,
+                count INTEGER DEFAULT 0,
+                PRIMARY KEY (user_id, pack_id)
+            )
+        """)
 
         await db.execute("""CREATE TABLE IF NOT EXISTS shop_items (id INTEGER PRIMARY KEY AUTOINCREMENT, item_type TEXT, name TEXT, price INTEGER, stock INTEGER)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS admin_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
@@ -395,6 +438,14 @@ class EventCD(StatesGroup):
     mult = State()
     mins = State()
 
+class EventCoin(StatesGroup):
+    mult = State()
+    mins = State()
+
+class EventXP(StatesGroup):
+    mult = State()
+    mins = State()
+
 class AdminAnnounce(StatesGroup):
     content = State()
 
@@ -403,6 +454,28 @@ class PvPState(StatesGroup):
 
 class TradeState(StatesGroup):
     waiting_target = State()
+
+# FSM Состояния для Сид-Паков
+class CreateSeedPack(StatesGroup):
+    title = State()
+    photo = State()
+    description = State()
+    card_select = State()
+    card_chance = State()
+    confirm_save = State()
+
+class EditSeedPack(StatesGroup):
+    select_pack = State()
+    menu = State()
+    edit_title = State()
+    edit_photo = State()
+    edit_description = State()
+    card_edit_chance = State()
+    add_card_select = State()
+    add_card_chance = State()
+
+class OpenSeedPackState(StatesGroup):
+    waiting_amount = State()
 
 # ========================================================================
 # УТИЛИТЫ И ХЕЛПЕРЫ ДЛЯ UI
@@ -445,6 +518,7 @@ async def add_quest_progress(user_id: int, field: str, amount: int = 1):
         user['q_battles'] >= 5 and
         user['q_shop_buys'] >= 1):
         
+        # Выдаем 900 монет
         await execute_db("""
             UPDATE users SET
                 coins = coins + 900,
@@ -457,9 +531,21 @@ async def add_quest_progress(user_id: int, field: str, amount: int = 1):
             WHERE id = ?
         """, (time.time() + 3600, user_id))
         
+        # ПЛЮС выдаем случайный Сид-Пак (если они есть в БД)
+        packs = await fetch_all("SELECT id, title FROM seed_packs")
+        pack_reward_text = ""
+        if packs:
+            gift_pack = random.choice(packs)
+            await execute_db("""
+                INSERT INTO user_seed_packs (user_id, pack_id, count)
+                VALUES (?, ?, 1)
+                ON CONFLICT(user_id, pack_id) DO UPDATE SET count = count + 1
+            """, (user_id, gift_pack['id']))
+            pack_reward_text = f"\n📦 А также вы получили Сид-Пак: <b>{gift_pack['title']}</b> (1 шт.)!"
+        
         if user['notif_quests'] == 1:
             try:
-                await bot.send_message(user_id, "🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>900 💰 Шекелей</b>!\nВозвращайтесь через 1 час за новыми заданиями!")
+                await bot.send_message(user_id, f"🎉 <b>ПОЗДРАВЛЯЕМ!</b>\nВы выполнили все ежедневные квесты и получили <b>900 💰 Шекелей</b>!{pack_reward_text}\nВозвращайтесь через 1 час за новыми заданиями!")
             except: pass
 
 async def is_admin(user_id: int) -> bool:
@@ -503,12 +589,12 @@ async def broadcast_message(text: str, notif_type: str = None):
 
 def get_main_keyboard(is_adm: bool = False, is_sgn: bool = False, lang: str = "ru"):
     i = 0 if lang == "ru" else 1
-    # 3 Колонки как просил пользователь
+    # Вместо Трейда кнопка Сид-Паки
     kb = [
         [KeyboardButton(text=BTN_DRAW[i]), KeyboardButton(text=BTN_PVE[i]), KeyboardButton(text=BTN_PVP[i])],
         [KeyboardButton(text=BTN_INV[i]), KeyboardButton(text=BTN_PROF[i]), KeyboardButton(text=BTN_EQ[i])],
         [KeyboardButton(text=BTN_QUESTS[i]), KeyboardButton(text=BTN_SHOP[i]), KeyboardButton(text=BTN_BP[i])],
-        [KeyboardButton(text=BTN_TOP[i]), KeyboardButton(text=BTN_IDX[i]), KeyboardButton(text=BTN_TRADE[i])],
+        [KeyboardButton(text=BTN_TOP[i]), KeyboardButton(text=BTN_IDX[i]), KeyboardButton(text=BTN_SEED_PACKS[i])],
         [KeyboardButton(text=BTN_SET[i])]
     ]
     
@@ -532,10 +618,24 @@ async def get_active_events():
     cd = settings['cd_mult'] if settings['cd_end'] > now else 1.0
     return luck, cd
 
+async def get_coin_xp_events():
+    settings = await fetch_one("SELECT * FROM server_settings WHERE id = 1")
+    now = time.time()
+    coin_mult = settings['coin_mult'] if settings['coin_end'] > now else 1.0
+    xp_mult = settings['xp_mult'] if settings['xp_end'] > now else 1.0
+    return coin_mult, xp_mult
+
 def roll_mutation():
     r = random.random()
     if r <= 0.02: return "Rainbow"
     if r <= 0.12: return "Gold"
+    return "Normal"
+
+# Фиксированные шансы мутаций для Сид-Паков: 12% Gold, 2% Rainbow, 86% Normal
+def roll_seed_pack_mutation():
+    r = random.random()
+    if r <= 0.02: return "Rainbow"
+    if r <= 0.14: return "Gold" # 2% + 12% = 14%
     return "Normal"
 
 def get_mutation_multiplier(mutation: str) -> float:
@@ -989,7 +1089,7 @@ async def cmd_quests(message: types.Message):
     
     text = (
         "📜 <b>ЕЖЕДНЕВНЫЕ КВЕСТЫ</b>\n"
-        "<i>Выполни все задания, чтобы сорвать куш в 900 💰 Шекелей!</i>\n"
+        "<i>Выполни все задания, чтобы сорвать куш в 900 💰 Шекелей и получить 1 Сид-Пак!</i>\n"
         "━━━━━━━━━━━━━━━━━━━━━━━━\n"
         f"1️⃣ <b>Открыть 10 карточек:</b>\n{make_progress_bar(c_op, 10, 8)} {c_op}/10 {'✅' if c_op>=10 else '❌'}\n\n"
         f"2️⃣ <b>Получить Редкую (или лучше):</b>\n{make_progress_bar(r_ob, 1, 8)} {r_ob}/1 {'✅' if r_ob>=1 else '❌'}\n\n"
@@ -1205,9 +1305,76 @@ async def cmd_getcard(message: types.Message):
     await message.answer_photo(photo=won_card['photo_id'], caption=msg)
 
 # ========================================================================
-# ПАГИНАЦИЯ ИНДЕКСА И ИНВЕНТАРЯ
+# ПАГИНАЦИЯ ИНДЕКСА И ИНВЕНТАРЯ (С ПОДДЕРЖКОЙ СИДПАКОВ)
 # ========================================================================
-async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
+async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8, pack_id: int = None):
+    # Если pack_id указан, выводим индекс Сид-Пака
+    if pack_id:
+        pack = await fetch_one("SELECT * FROM seed_packs WHERE id = ?", (pack_id,))
+        if not pack: return "Сид-пак не найден.", None
+        
+        pack_cards = await fetch_all("""
+            SELECT c.*, spc.drop_chance as pack_drop_chance 
+            FROM seed_pack_cards spc
+            JOIN cards c ON spc.card_id = c.id
+            WHERE spc.pack_id = ?
+        """, (pack_id,))
+        
+        if not pack_cards: return f"Сид-Пак <b>{pack['title']}</b> пуст.", None
+        
+        luck_mult, _ = await get_active_events()
+        
+        total_w = 0
+        weights_dict = {}
+        for c in pack_cards:
+            weight = c['pack_drop_chance']
+            if weight < 15.0: weight *= luck_mult
+            weights_dict[c['id']] = weight
+            total_w += weight
+            
+        def seed_sort_key(c):
+            return weights_dict.get(c['id'], 9999)
+            
+        pack_cards.sort(key=seed_sort_key)
+        
+        total_pages = max(1, math.ceil(len(pack_cards) / items_per_page))
+        page = max(0, min(page, total_pages - 1))
+        
+        text = f"📦 <b>ИНДЕКС СИД-ПАКА: {pack['title']} (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        if luck_mult > 1.0: text += f"🍀 <b>ИВЕНТ УДАЧИ АКТИВЕН (x{luck_mult})! Шансы пересчитаны!</b>\n\n"
+        
+        start_idx = page * items_per_page
+        end_idx = start_idx + items_per_page
+        page_items = pack_cards[start_idx:end_idx]
+        
+        user_inv = await fetch_all("SELECT DISTINCT card_id FROM inventory WHERE user_id = ?", (user_id,))
+        user_card_ids = [item['card_id'] for item in user_inv]
+        
+        for i, c in enumerate(page_items, start_idx + 1):
+            n_fmt = format_card_name(c)
+            r_fmt = format_rarity_display(c['rarity'])
+            
+            real_chance = (weights_dict.get(c['id'], 0) / total_w) * 100 if total_w > 0 else 0
+            chance_str = f"Шанс в паке: {real_chance:.2f}%"
+            
+            if c['id'] in user_card_ids:
+                text += f"{i}. {n_fmt}\n      └ 💎 {r_fmt} ({chance_str})\n"
+                if c['class_type'] == 'Booster': text += f"      └ ✨ Бафф: DMG x{c['booster_dmg_mult']} // HP x{c['booster_hp_mult']}\n\n"
+                else: text += f"      └ ⚔️ Урон: {c['damage']} // ❤️ Здоровье: {c['hp']}\n\n"
+            else:
+                text += f"{i}. <b>???</b> (Не открыто)\n      └ 💎 {r_fmt} ({chance_str})\n\n"
+                
+        kb = []
+        nav_row = []
+        if page > 0: nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"idxpack_page_{pack_id}_{page-1}"))
+        if total_pages > 1: nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
+        if page < total_pages - 1: nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"idxpack_page_{pack_id}_{page+1}"))
+        if nav_row: kb.append(nav_row)
+        kb.append([InlineKeyboardButton(text="🔙 К выбору категорий", callback_data="idx_categories")])
+        
+        return text, InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+    # Обычный индекс
     all_cards = await fetch_all("SELECT * FROM cards")
     user_inv = await fetch_all("SELECT DISTINCT card_id FROM inventory WHERE user_id = ?", (user_id,))
     user_card_ids = [item['card_id'] for item in user_inv]
@@ -1226,7 +1393,7 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
     total_pages = max(1, math.ceil(len(all_cards) / items_per_page))
     page = max(0, min(page, total_pages - 1))
     
-    text = f"📖 <b>МИРОВОЙ ИНДЕКС (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"📖 <b>МИРОВОЙ ИНДЕКС ГАЧИ (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     if luck_mult > 1.0: text += f"🍀 <b>ИВЕНТ УДАЧИ АКТИВЕН (x{luck_mult})! Шансы пересчитаны!</b>\n\n"
     
     start_idx = page * items_per_page
@@ -1265,6 +1432,7 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
     if total_pages > 1: nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
     if page < total_pages - 1: nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"idx_page_{page+1}"))
     if nav_row: kb.append(nav_row)
+    kb.append([InlineKeyboardButton(text="🔙 К выбору категорий", callback_data="idx_categories")])
     
     return text, InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
 
@@ -1272,8 +1440,56 @@ async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
 @dp.message(F.text.in_(BTN_IDX))
 async def cmd_index(message: types.Message):
     if await check_ban(message.from_user.id): return
-    text, kb = await get_index_text(message.from_user.id, 0)
-    await message.answer(text, reply_markup=kb)
+    # Отправляем меню выбора категории индекса
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚪ Обычная Гача", callback_data="idx_category_gacha")],
+        [InlineKeyboardButton(text="📦 Сид-Паки", callback_data="idx_category_packs")]
+    ])
+    await message.answer("📖 <b>МИРОВОЙ ИНДЕКС</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите категорию для просмотра вероятностей и карт:", reply_markup=kb)
+
+@dp.callback_query(F.data == "idx_categories")
+async def cb_idx_categories(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚪ Обычная Гача", callback_data="idx_category_gacha")],
+        [InlineKeyboardButton(text="📦 Сид-Паки", callback_data="idx_category_packs")]
+    ])
+    try: await callback.message.edit_text("📖 <b>МИРОВОЙ ИНДЕКС</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите категорию для просмотра:", reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "idx_category_gacha")
+async def cb_idx_category_gacha(callback: types.CallbackQuery):
+    text, kb = await get_index_text(callback.from_user.id, 0)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "idx_category_packs")
+async def cb_idx_category_packs(callback: types.CallbackQuery):
+    packs = await fetch_all("SELECT * FROM seed_packs")
+    if not packs:
+        return await callback.answer("❌ Сид-Паки еще не созданы администратором!", show_alert=True)
+    kb = []
+    for p in packs:
+        kb.append([InlineKeyboardButton(text=f"📦 {p['title']}", callback_data=f"idxpack_select_{p['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="idx_categories")])
+    await callback.message.edit_text("📦 <b>ВЫБЕРИТЕ СИД-ПАК ДЛЯ ИНДЕКСА</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("idxpack_select_"))
+async def cb_idxpack_select(callback: types.CallbackQuery):
+    pack_id = int(callback.data.split("_")[2])
+    text, kb = await get_index_text(callback.from_user.id, 0, pack_id=pack_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("idxpack_page_"))
+async def cb_idxpack_page(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    pack_id = int(parts[2])
+    page = int(parts[3])
+    text, kb = await get_index_text(callback.from_user.id, page, pack_id=pack_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("idx_page_"))
 async def callback_index_page(callback: types.CallbackQuery):
@@ -1291,7 +1507,14 @@ async def get_inventory_text_and_kb(user_id: int, page: int = 0, items_per_page:
         WHERE i.user_id = ? AND i.count > 0
     """, (user_id,))
     
-    if not inv: return "🎒 Ваш инвентарь пуст. Используйте /getcard", None
+    # Кнопки-переключатели инвентаря
+    toggle_row = [
+        InlineKeyboardButton(text="🎒 Карты (Выбрано)", callback_data="ignore"),
+        InlineKeyboardButton(text="📦 Сид-Паки", callback_data="inv_packs_menu")
+    ]
+    
+    if not inv: 
+        return "🎒 Ваш инвентарь карт пуст. Используйте /getcard", InlineKeyboardMarkup(inline_keyboard=[toggle_row])
         
     mutation_weight = {"Rainbow": 3, "Gold": 2, "Normal": 1}
     
@@ -1308,7 +1531,7 @@ async def get_inventory_text_and_kb(user_id: int, page: int = 0, items_per_page:
     end_idx = start_idx + items_per_page
     page_items = inv[start_idx:end_idx]
     
-    text = f"🎒 <b>ИНВЕНТАРЬ (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text = f"🎒 <b>ИНВЕНТАРЬ КАРТ (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
     for item in page_items:
         n_fmt = format_card_name(item).replace(" <b>[#-001]</b>", "")
         mut_emoji = ""
@@ -1317,6 +1540,8 @@ async def get_inventory_text_and_kb(user_id: int, page: int = 0, items_per_page:
         text += f"• {mut_emoji}{n_fmt} — <b>{item['count']} шт.</b>\n"
         
     kb = []
+    kb.append(toggle_row)
+    
     nav_row = []
     if page > 0: nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"inv_page_{page-1}"))
     if total_pages > 1: nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
@@ -1335,7 +1560,7 @@ async def cmd_inventory(message: types.Message):
 @dp.callback_query(F.data.startswith("inv_page_"))
 async def callback_inventory_page(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
-    text, kb = await get_inventory_text_and_kb(callback.fromuser.id, page)
+    text, kb = await get_inventory_text_and_kb(callback.from_user.id, page)
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
@@ -1554,7 +1779,7 @@ async def equip_var_select(callback: types.CallbackQuery, state: FSMContext):
     if inv_id in [user['equip1'], user['equip2'], user['equip3']]:
         return await callback.answer("❌ Эта конкретная карта уже экипирована в другом слоте!", show_alert=True)
         
-    # Проверка на то, что слот не может дублировать card_id (нельзя надеть 3 одинаковых манго)
+    # Проверка на то, что слот не может дублировать card_id (нельзя надеть 3 одинаковых юнита)
     card_info = await fetch_one("SELECT card_id FROM inventory WHERE id = ?", (inv_id,))
     if not card_info: return await callback.answer("Карта не найдена!")
     
@@ -1774,7 +1999,7 @@ async def callback_bp_claim(callback: types.CallbackQuery):
     await callback_bp_level(callback)
 
 # ========================================================================
-# БОЕВОЙ ДВИЖОК, БАЛАНС И ОПЫТ БП
+# БОЕВОЙ ДВИЖОК, БАЛАНС И ОПЫТ БП (С УЧЕТОМ ИВЕНТОВ МОНЕТ И ОПЫТА ИИ)
 # ========================================================================
 async def get_team_data(user_id: int):
     user = await fetch_one("SELECT equip1, equip2, equip3 FROM users WHERE id = ?", (user_id,))
@@ -1874,12 +2099,18 @@ async def get_bot_team(user_id: int, difficulty_mult: float, rank_name: str, dif
         c_copy['max_hp'] = c_copy['hp']
         
         mut_chance = random.random()
+        # ========================================================================
+        # REBALАНС МУТАЦИЙ ИИ (ПЛАТИНА, ДАЙМОНД, РУБИН ТЕПЕРЬ ПОЛУЧАЮТ МЕНЬШЕ РАДУГИ/ГОЛДЫ)
+        # ========================================================================
         if difficulty_mult >= 1.0 or diff_type == "nightmare": 
-            if mut_chance < 0.15 * difficulty_mult: 
+            rainbow_prob = min(0.04, 0.015 * difficulty_mult) # Кап 4% вместо бесконечного роста
+            gold_prob = min(0.18, 0.07 * difficulty_mult)     # Кап 18% вместо 45%
+            
+            if mut_chance < rainbow_prob: 
                 c_copy['mutation'] = "Rainbow"
                 c_copy['damage'] = int(c_copy['damage'] * 1.2)
                 c_copy['hp'] = int(c_copy['hp'] * 1.2)
-            elif mut_chance < 0.45 * difficulty_mult: 
+            elif mut_chance < rainbow_prob + gold_prob: 
                 c_copy['mutation'] = "Gold"
                 c_copy['damage'] = int(c_copy['damage'] * 1.1)
                 c_copy['hp'] = int(c_copy['hp'] * 1.1)
@@ -2117,27 +2348,37 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
             final_text += f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>"
     else:
+        # Учитываем новые мультипликаторы ивентов монет и опыта БП
+        coin_mult, xp_mult_event = await get_coin_xp_events()
+        
         if winner == p1_name:
             user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
             rank = await get_user_rank(user['trophies'])
             
-            coins_won = int(random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85)
+            coins_won = int(random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult)
             won_t = await get_dynamic_trophies(rank['name'], diff_trophies_scale)
             
             await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
-            final_text += f"🎉 <b>Награды за победу:</b>\n💰 {coins_won} Шекелей\n🏆 {won_t} Кубков\n"
+            final_text += f"🎉 <b>Награды за победу:</b>\n💰 {coins_won} Шекелей"
+            if coin_mult > 1.0:
+                final_text += f" <i>(Ивент монет x{coin_mult}!)</i>"
+            final_text += f"\n🏆 {won_t} Кубков\n"
             
-            bp_xp = int(20 * diff_bp_mult)
+            bp_xp = int(20 * diff_bp_mult * xp_mult_event)
             lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
             final_text += f"🎫 +{bp_xp} Опыта БП"
+            if xp_mult_event > 1.0:
+                final_text += f" <i>(Ивент опыта БП x{xp_mult_event}!)</i>"
             if lvl_up: bp_messages.append(f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> Вы достигли {new_lvl} уровня в сезоне «{bp_title}»! Зайдите в меню Батл-пассов за наградой.")
             
         elif winner == p2_name:
             await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
             final_text += f"💀 Вы проиграли ИИ и потеряли <b>2 🏆</b>.\n"
-            bp_xp = int(5 * diff_bp_mult)
+            bp_xp = int(5 * diff_bp_mult * xp_mult_event)
             lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
             final_text += f"🎫 +{bp_xp} Опыта БП (Утешительный приз)"
+            if xp_mult_event > 1.0:
+                final_text += f" <i>(Ивент опыта БП x{xp_mult_event}!)</i>"
             if lvl_up: bp_messages.append(f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> Вы достигли {new_lvl} уровня в сезоне «{bp_title}»! Зайдите в меню Батл-пассов за наградой.")
             
     await msg.edit_text(final_text)
@@ -2394,7 +2635,6 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
 # ========================================================================
 # ТРЕЙДЫ (БЕЗОПАСНЫЙ ОБМЕН КАРТАМИ С ТРАНЗАКЦИЯМИ И ДВОЙНЫМ ПОДТВЕРЖДЕНИЕМ)
 # ========================================================================
-@dp.message(F.text.in_(BTN_TRADE))
 @dp.message(Command("trade"))
 async def cmd_trade_request(message: types.Message, state: FSMContext):
     if await check_ban(message.from_user.id): return
@@ -2886,14 +3126,225 @@ async def trade_timeout_task():
         await asyncio.sleep(60)
 
 # ========================================================================
-# ПАНЕЛЬ АДМИНИСТРАТОРА
+# СИСТЕМА СИД-ПАКОВ (ИНТЕРФЕЙС И ОПЕРАЦИИ ИГРОКА)
+# ========================================================================
+@dp.message(F.text.in_(BTN_SEED_PACKS))
+async def cmd_seed_packs_menu(message: types.Message):
+    if await check_ban(message.from_user.id): return
+    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (message.from_user.id,))
+    packs = await fetch_all("SELECT * FROM seed_packs")
+    
+    text = (
+        "📦 <b>МАГАЗИН СИД-ПАКОВ</b>\n"
+        f"💰 Твой баланс: <b>{user['coins']} Шекелей</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Сид-Пак — это особый набор карт с гарантированным набором юнитов "
+        "и повышенным шансом мутаций (<b>12% на Золотую</b>, <b>2% на Радужную</b>)!\n\n"
+        "Вы можете приобрести любой пак из списка ниже за фиксированную стоимость в <b>2000 Шекелей</b>:\n"
+    )
+    
+    kb = []
+    if not packs:
+        text += "\n<i>Сид-Паки пока не созданы администратором сервера. Ожидайте!</i>"
+    else:
+        for p in packs:
+            desc_text = f" — {p['description']}" if p['description'] else ""
+            text += f"🔹 <b>{p['title']}</b>{desc_text}\n"
+            kb.append([InlineKeyboardButton(text=f"🛒 Купить {p['title']} (2000 💰)", callback_data=f"sp_buy_{p['id']}")])
+            
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("sp_buy_"))
+async def callback_sp_buy(callback: types.CallbackQuery):
+    pack_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    
+    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (user_id,))
+    pack = await fetch_one("SELECT * FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not pack: return await callback.answer("❌ Сид-пак не найден!", show_alert=True)
+    if user['coins'] < 2000: return await callback.answer("❌ Недостаточно шекелей для покупки! Нужно 2000 💰", show_alert=True)
+    
+    await execute_db("UPDATE users SET coins = coins - 2000 WHERE id = ?", (user_id,))
+    await execute_db("""
+        INSERT INTO user_seed_packs (user_id, pack_id, count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(user_id, pack_id) DO UPDATE SET count = count + 1
+    """, (user_id, pack_id))
+    
+    await callback.answer("🎉 Покупка Сид-Пака успешна!", show_alert=True)
+    
+    # Обновляем меню магазина Сид-паков
+    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (user_id,))
+    packs = await fetch_all("SELECT * FROM seed_packs")
+    text = (
+        "📦 <b>МАГАЗИН СИД-ПАКОВ</b>\n"
+        f"💰 Твой баланс: <b>{user['coins']} Шекелей</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Сид-Пак куплен и добавлен в ваш инвентарь!\n\n"
+        "Вы можете приобрести любой пак из списка ниже за <b>2000 Шекелей</b>:\n"
+    )
+    kb = []
+    for p in packs:
+        desc_text = f" — {p['description']}" if p['description'] else ""
+        text += f"🔹 <b>{p['title']}</b>{desc_text}\n"
+        kb.append([InlineKeyboardButton(text=f"🛒 Купить {p['title']} (2000 💰)", callback_data=f"sp_buy_{p['id']}")])
+        
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+# Переключение инвентаря на Сид-Паки
+@dp.callback_query(F.data == "inv_packs_menu")
+async def cb_inv_packs_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_packs = await fetch_all("""
+        SELECT usp.count, sp.id as pack_id, sp.title, sp.description
+        FROM user_seed_packs usp
+        JOIN seed_packs sp ON usp.pack_id = sp.id
+        WHERE usp.user_id = ? AND usp.count > 0
+    """, (user_id,))
+    
+    text = (
+        "🎒 <b>ИНВЕНТАРЬ СИД-ПАКОВ</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "Здесь хранятся ваши запечатанные Сид-Паки. Выберите пак для распаковки:\n\n"
+    )
+    
+    kb = []
+    toggle_row = [
+        InlineKeyboardButton(text="🎒 Карты", callback_data="inv_cards_menu"),
+        InlineKeyboardButton(text="📦 Сид-Паки (Выбрано)", callback_data="ignore")
+    ]
+    kb.append(toggle_row)
+    
+    if not user_packs:
+        text += "<i>У вас пока нет купленных Сид-Паков. Приобрести их можно во вкладке меню «📦 Сид-Паки».</i>"
+    else:
+        for p in user_packs:
+            text += f"📦 <b>{p['title']}</b> — <b>{p['count']} шт.</b>\n"
+            kb.append([InlineKeyboardButton(text=f"🔓 Открыть {p['title']}", callback_data=f"sp_open_select_{p['pack_id']}")])
+            
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data == "inv_cards_menu")
+async def cb_inv_cards_menu(callback: types.CallbackQuery):
+    text, kb = await get_inventory_text_and_kb(callback.from_user.id, 0)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sp_open_select_"))
+async def cb_sp_open_select(callback: types.CallbackQuery, state: FSMContext):
+    pack_id = int(callback.data.split("_")[3])
+    user_id = callback.from_user.id
+    
+    user_pack = await fetch_one("SELECT count FROM user_seed_packs WHERE user_id = ? AND pack_id = ?", (user_id, pack_id))
+    pack = await fetch_one("SELECT title FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not user_pack or user_pack['count'] <= 0:
+        return await callback.answer("❌ У вас нет этого сид-пака!", show_alert=True)
+        
+    await state.update_data(open_pack_id=pack_id, max_amount=user_pack['count'])
+    await callback.message.answer(
+        f"🔓 <b>РАСПАКОВКА СИД-ПАКА: {pack['title']}</b>\n"
+        f"У вас в наличии: <b>{user_pack['count']} шт.</b>\n\n"
+        "Введите целым числом количество Сид-Паков, которые вы хотите открыть:"
+    )
+    await state.set_state(OpenSeedPackState.waiting_amount)
+    await callback.answer()
+
+@dp.message(OpenSeedPackState.waiting_amount)
+async def process_sp_open_amount(message: types.Message, state: FSMContext):
+    val = message.text.strip()
+    data = await state.get_data()
+    pack_id = data['open_pack_id']
+    max_amount = data['max_amount']
+    user_id = message.from_user.id
+    
+    if not val.isdigit() or int(val) <= 0:
+        return await message.answer("❌ Введите корректное положительное число.")
+        
+    amount = int(val)
+    if amount > max_amount:
+        return await message.answer(f"❌ Недостаточно паков! Вы можете открыть максимум {max_amount} шт.")
+        
+    # Списываем паки
+    await execute_db("UPDATE user_seed_packs SET count = count - ? WHERE user_id = ? AND pack_id = ?", (amount, user_id, pack_id))
+    
+    # Загружаем карты пака
+    pack_cards = await fetch_all("SELECT card_id, drop_chance FROM seed_pack_cards WHERE pack_id = ?", (pack_id,))
+    pack = await fetch_one("SELECT title, photo_id FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not pack_cards:
+        await execute_db("UPDATE user_seed_packs SET count = count + ? WHERE user_id = ? AND pack_id = ?", (amount, user_id, pack_id))
+        await state.clear()
+        return await message.answer("❌ Этот Сид-Пак пуст (внутри нет карт). Свяжитесь с администрацией. Паки возвращены.")
+        
+    luck_mult, _ = await get_active_events()
+    weights = []
+    cards_list = []
+    
+    for pc in pack_cards:
+        weight = pc['drop_chance']
+        if weight < 15.0: weight *= luck_mult
+        weights.append(weight)
+        
+        card_info = await fetch_one("SELECT * FROM cards WHERE id = ?", (pc['card_id'],))
+        cards_list.append(card_info)
+        
+    won_cards = []
+    for _ in range(amount):
+        won_card = random.choices(cards_list, weights=weights, k=1)[0]
+        mut = roll_seed_pack_mutation() # Фиксированные шансы мутации сидпака
+        _, serial, _ = await give_card_to_user(user_id, won_card['id'], mut, won_card['rarity'])
+        
+        c_copy = dict(won_card)
+        c_copy['mutation'] = mut
+        c_copy['serial_number'] = serial
+        won_cards.append(c_copy)
+        
+    # Статистика выпавших
+    await add_quest_progress(user_id, 'q_cards_opened', amount)
+    if any(c['rarity'] == 'Rare' for c in won_cards):
+        await add_quest_progress(user_id, 'q_rare_obtained', 1)
+        
+    text_results = f"🎉 <b>РАСПАКОВКА {amount}x СИД-ПАКА «{pack['title']}» ЗАВЕРШЕНА!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    
+    if amount == 1:
+        single = won_cards[0]
+        mut_str = "🌈 Радужная " if single['mutation'] == 'Rainbow' else ("⭐ Золотая " if single['mutation'] == 'Gold' else "")
+        mult = get_mutation_multiplier(single['mutation'])
+        
+        caption_text = (
+            f"🎉 <b>ВЫ ВЫБИЛИ КАРТУ ИЗ СИД-ПАКА!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"🃏 {mut_str}{format_card_name(single)}\n"
+            f"💎 <b>Редкость:</b> {format_rarity_display(single['rarity'])}\n"
+        )
+        if single['class_type'] == 'Booster':
+            caption_text += f"✨ <b>БУСТЕР</b>\n⚔️ DMG Mult: <b>x{round(single['booster_dmg_mult']*mult, 2)}</b> | ❤️ HP Mult: <b>x{round(single['booster_hp_mult']*mult, 2)}</b>\n"
+        else:
+            caption_text += f"⚔️ <b>Урон:</b> {int(single['damage']*mult)} | ❤️ <b>Здоровье:</b> {int(single['hp']*mult)}\n"
+            
+        await message.answer_photo(photo=single['photo_id'], caption=caption_text)
+    else:
+        # Для массового открытия выводим структурированный список
+        text_results += "📦 <b>Список выпавших карт:</b>\n"
+        for idx, c in enumerate(won_cards, 1):
+            mut_str = "🌈 " if c['mutation'] == 'Rainbow' else ("⭐ " if c['mutation'] == 'Gold' else "⚪ ")
+            text_results += f"{idx}. {mut_str}{format_card_name(c)}\n"
+        text_results += "\n<i>Все карты были перемещены в ваш 🎒 Инвентарь.</i>"
+        await message.answer(text_results)
+        
+    await state.clear()
+
+# ========================================================================
+# ПАНЕЛЬ АДМИНИСТРАТОРА (ОБНОВЛЕННАЯ С КНОПКАМИ ИВЕНТОВ И СИД-ПАКОВ)
 # ========================================================================
 def get_admin_main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🃏 Карты", callback_data="adm_cards"), InlineKeyboardButton(text="👤 Игроки", callback_data="adm_users")],
         [InlineKeyboardButton(text="🎉 Ивенты", callback_data="adm_events"), InlineKeyboardButton(text="👑 Админы", callback_data="adm_admins")],
         [InlineKeyboardButton(text="🎟 Батл-пассы", callback_data="adm_bp_main"), InlineKeyboardButton(text="✍️ Сигнеры", callback_data="adm_signers")],
-        [InlineKeyboardButton(text="🏆 Награды за Топ", callback_data="adm_lb_main")],
+        [InlineKeyboardButton(text="🏆 Награды за Топ", callback_data="adm_lb_main"), InlineKeyboardButton(text="📦 Сид-Паки", callback_data="adm_sp_main")],
         [InlineKeyboardButton(text="📦 Бэкап БД", callback_data="adm_db")]
     ])
 
@@ -3241,7 +3692,7 @@ async def adm_card_del_finish(message: types.Message, state: FSMContext):
     await state.clear()
 
 # ========================================================================
-# УПРАВЛЕНИЕ ИГРОКАМИ
+# УПРАВЛЕНИЕ ИГРОКАМИ В АДМИНКЕ
 # ========================================================================
 @dp.callback_query(F.data == "adm_users")
 async def cq_adm_users(callback: types.CallbackQuery):
@@ -3648,7 +4099,6 @@ async def adm_bp_finish_and_save(callback: types.CallbackQuery, state: FSMContex
     await log_admin(callback.from_user.id, f"Создал новый Батл-пасс: {data['bp_title']}")
     await state.clear()
 
-
 # ========================================================================
 # НАГРАДЫ И ИВЕНТЫ (АДМИНКА)
 # ========================================================================
@@ -3768,6 +4218,7 @@ async def adm_lb_mut_select(callback: types.CallbackQuery, state: FSMContext):
 async def cq_adm_events(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🍀 Ивент Удачи", callback_data="ev_luck"), InlineKeyboardButton(text="⏳ Ивент КД", callback_data="ev_cd")],
+        [InlineKeyboardButton(text="💰 Множитель монет", callback_data="ev_coin"), InlineKeyboardButton(text="🎫 Множитель опыта БП", callback_data="ev_xp")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
     await callback.message.edit_text("🎉 <b>Запуск Ивентов</b>\nПри запуске бот сделает массовую рассылку всем игрокам.", reply_markup=kb)
@@ -3822,6 +4273,68 @@ async def ev_cd_finish(message: types.Message, state: FSMContext):
         asyncio.create_task(broadcast_message(f"⏳ <b>ГЛОБАЛЬНЫЙ ИВЕНТ СКОРОСТИ!</b>\nТаймер выбивания карт ускорен в {data['mult']} раз на {mins} минут!\n\nКрути гачу быстрее: /getcard", notif_type="notif_events"))
     except: await message.answer("Ошибка ввода.")
 
+# Множитель монет
+@dp.callback_query(F.data == "ev_coin")
+async def ev_coin_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи множитель ШЕКЕЛЕЙ (например 1.5 или 2.0 для х2 за бои):")
+    await state.set_state(EventCoin.mult)
+    await callback.answer()
+
+@dp.message(EventCoin.mult)
+async def ev_coin_mult(message: types.Message, state: FSMContext):
+    await state.update_data(mult=float(message.text.replace(',','.')))
+    await message.answer("На сколько МИНУТ запускаем?")
+    await state.set_state(EventCoin.mins)
+
+@dp.message(EventCoin.mins)
+async def ev_coin_finish(message: types.Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        mins = int(message.text)
+        end = time.time() + (mins * 60)
+        await execute_db("UPDATE server_settings SET coin_mult = ?, coin_end = ? WHERE id = 1", (data['mult'], end))
+        await log_admin(message.from_user.id, f"COIN EVENT x{data['mult']} for {mins}m")
+        await message.answer("✅ Ивент Множителя монет запущен. Начинаю рассылку...")
+        await state.clear()
+        asyncio.create_task(broadcast_message(f"💰 <b>ГЛОБАЛЬНЫЙ ИВЕНТ НА МОНЕТЫ!</b>\nКоличество получаемых шекелей в боях против ИИ увеличено в {data['mult']} раз на {mins} минут!\n\nЗарабатывай золото в боях: /pve", notif_type="notif_events"))
+    except: await message.answer("Ошибка ввода.")
+
+# Множитель опыта БП
+@dp.callback_query(F.data == "ev_xp")
+async def ev_xp_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введи множитель ОПЫТА БП (например 2.0 для х2 опыта за бои):")
+    await state.set_state(EventXP.mult)
+    await callback.answer()
+
+@dp.message(EventXP.mult)
+async def ev_xp_mult(message: types.Message, state: FSMContext):
+    try:
+        await state.update_data(mult=float(message.text.replace(',', '.')))
+        await message.answer("На сколько МИНУТ запускаем?")
+        await state.set_state(EventXP.mins)
+    except ValueError:
+        await message.answer("❌ Введите корректный множитель (число).")
+
+@dp.message(EventXP.mins)
+async def ev_xp_finish(message: types.Message, state: FSMContext):
+    try:
+        data = await state.get_data()
+        mins = int(message.text)
+        end = time.time() + (mins * 60)
+        await execute_db("UPDATE server_settings SET xp_mult = ?, xp_end = ? WHERE id = 1", (data['mult'], end))
+        await log_admin(message.from_user.id, f"XP EVENT x{data['mult']} for {mins}m")
+        await message.answer("✅ Ивент Множителя опыта БП запущен. Начинаю рассылку...")
+        await state.clear()
+        asyncio.create_task(broadcast_message(
+            f"🎫 <b>ГЛОБАЛЬНЫЙ ИВЕНТ НА ОПЫТ БП!</b>\n"
+            f"Получаемый опыт Батл-пасса во всех боях увеличен в {data['mult']} раз на {mins} минут!\n\n"
+            f"Прокачай свой БП скорее: /pve", 
+            notif_type="notif_events"
+        ))
+    except Exception as e:
+        await message.answer(f"Ошибка ввода: {e}")
+        await state.clear()
+
 @dp.message(Command("announce"))
 async def cmd_announce(message: types.Message, state: FSMContext):
     if not await is_admin(message.from_user.id): return
@@ -3874,6 +4387,473 @@ async def process_bd_upload(message: types.Message):
     await message.answer("✅ <b>БД успешно загружена и заменена!</b>")
 
 # ========================================================================
+# АДМИН-ПАНЕЛЬ: УПРАВЛЕНИЕ СИД-ПАКОВ (СОЗДАНИЕ, ИЗМЕНЕНИЕ ШАНСОВ, УДАЛЕНИЕ)
+# ========================================================================
+@dp.callback_query(F.data == "adm_sp_main")
+async def cq_adm_sp_main(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать Сид-Пак", callback_data="adm_sp_create")],
+        [InlineKeyboardButton(text="✏️ Редактировать / Удалить", callback_data="adm_sp_manage_list")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
+    ])
+    await callback.message.edit_text(
+        "📦 <b>УПРАВЛЕНИЕ СИД-ПАКАМИ</b>\n"
+        "Здесь вы можете создавать новые тематические Сид-Паки и изменять их содержимое.", 
+        reply_markup=kb
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_sp_create")
+async def cq_adm_sp_create_start(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("📦 <b>Создание Сид-Пака</b>\n\nШаг 1: Введите красивое НАЗВАНИЕ пака (например, <i>Mango Fest Pack</i>):")
+    await state.set_state(CreateSeedPack.title)
+    await callback.answer()
+
+@dp.message(CreateSeedPack.title)
+async def adm_sp_cr_title(message: types.Message, state: FSMContext):
+    await state.update_data(sp_title=message.text)
+    kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить")]], resize_keyboard=True)
+    await message.answer("Шаг 2: Отправьте ФОТО для пака (или нажмите Пропустить):", reply_markup=kb)
+    await state.set_state(CreateSeedPack.photo)
+
+@dp.message(CreateSeedPack.photo)
+async def adm_sp_cr_photo(message: types.Message, state: FSMContext):
+    if message.text == "Пропустить":
+        await state.update_data(sp_photo=None)
+    elif message.photo:
+        await state.update_data(sp_photo=message.photo[-1].file_id)
+    else:
+        return await message.answer("Пожалуйста, отправьте фото или нажмите кнопку Пропустить.")
+        
+    await message.answer("Шаг 3: Введите описание Сид-Пака (например: <i>Набор с повышенными шансами на Огненные типы!</i>):", reply_markup=ReplyKeyboardRemove())
+    await state.set_state(CreateSeedPack.description)
+
+@dp.message(CreateSeedPack.description)
+async def adm_sp_cr_desc(message: types.Message, state: FSMContext):
+    await state.update_data(sp_desc=message.text, sp_cards={})
+    await cq_adm_sp_show_card_select(message, state, 0)
+
+async def cq_adm_sp_show_card_select(message_or_call, state: FSMContext, page: int):
+    all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    if not all_cards:
+        if isinstance(message_or_call, types.CallbackQuery):
+            await message_or_call.message.answer("❌ В базе нет ни одной карты для добавления!")
+        else:
+            await message_or_call.answer("❌ В базе нет ни одной карты для добавления!")
+        return await state.clear()
+        
+    items = []
+    for c in all_cards:
+        items.append({"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"})
+        
+    kb = get_pagination_keyboard(items, page, "spaddc", columns=1, items_per_page=6)
+    
+    data = await state.get_data()
+    sp_cards = data.get('sp_cards', {})
+    
+    current_list_str = ""
+    if sp_cards:
+        current_list_str = "\n<b>Текущий состав пака:</b>\n"
+        for idx, (c_id, chance) in enumerate(sp_cards.items(), 1):
+            c_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (c_id,))
+            current_list_str += f"{idx}. {c_info['name'] if c_info else 'ID ' + str(c_id)} — {chance}%\n"
+            
+    text = (
+        f"⚙️ <b>Добавление карт в Сид-Пак</b>\n"
+        f"Выберите карту из списка ниже, чтобы добавить её в Сид-Пак:\n"
+        f"{current_list_str}\n"
+        f"<i>Для продолжения или завершения выберите опцию в меню ниже.</i>"
+    )
+    
+    kb.inline_keyboard.append([InlineKeyboardButton(text="✅ Завершить и проверить", callback_data="sp_create_finish")])
+    
+    if isinstance(message_or_call, types.CallbackQuery):
+        try: await message_or_call.message.edit_text(text, reply_markup=kb)
+        except: pass
+    else:
+        await message_or_call.answer(text, reply_markup=kb)
+        
+    await state.set_state(CreateSeedPack.card_select)
+
+@dp.callback_query(CreateSeedPack.card_select, F.data.startswith("spaddc_page_"))
+async def cb_adm_sp_cr_card_paginate(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[2])
+    await cq_adm_sp_show_card_select(callback, state, page)
+    await callback.answer()
+
+@dp.callback_query(CreateSeedPack.card_select, F.data.startswith("spaddc_"))
+async def cb_adm_sp_cr_card_select(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[1])
+    
+    card_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (card_id,))
+    if not card_info:
+        return await callback.answer("Карта не найдена!", show_alert=True)
+        
+    await state.update_data(sel_card_id=card_id)
+    await callback.message.answer(f"Введите шанс выпадения (вес) для карты <b>{card_info['name']}</b> (например, 10 или 25.5):")
+    await state.set_state(CreateSeedPack.card_chance)
+    await callback.answer()
+
+@dp.message(CreateSeedPack.card_chance)
+async def adm_sp_cr_card_chance(message: types.Message, state: FSMContext):
+    try:
+        chance = float(message.text.replace(',', '.'))
+        if chance <= 0: raise ValueError
+        
+        data = await state.get_data()
+        sp_cards = data.get('sp_cards', {})
+        sel_card_id = data['sel_card_id']
+        
+        sp_cards[sel_card_id] = chance
+        await state.update_data(sp_cards=sp_cards)
+        
+        await message.answer("✅ Карта успешно добавлена в пак!")
+        await cq_adm_sp_show_card_select(message, state, 0)
+    except:
+        await message.answer("❌ Введите положительное число!")
+
+@dp.callback_query(CreateSeedPack.card_select, F.data == "sp_create_finish")
+async def cb_adm_sp_finish_draft(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    sp_cards = data.get('sp_cards', {})
+    
+    if not sp_cards:
+        return await callback.answer("❌ Пак не может быть пустым! Добавьте хотя бы одну карту.", show_alert=True)
+        
+    title = data['sp_title']
+    desc = data['sp_desc']
+    
+    text = (
+        f"🔬 <b>ПРОВЕРКА СИД-ПАКА</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📝 Название: <b>{title}</b>\n"
+        f"💬 Описание: {desc}\n\n"
+        f"📊 <b>Содержимое пака:</b>\n"
+    )
+    
+    total_weights = sum(sp_cards.values())
+    for idx, (c_id, chance) in enumerate(sp_cards.items(), 1):
+        c_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (c_id,))
+        pct = (chance / total_weights) * 100 if total_weights > 0 else 0
+        text += f"  └ {idx}. {c_info['name'] if c_info else 'ID ' + str(c_id)} — {chance} (вероятность ~{pct:.2f}%)\n"
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💾 СОХРАНИТЬ И ОПУБЛИКОВАТЬ", callback_data="sp_draft_save")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="sp_draft_cancel")]
+    ])
+    
+    if data['bp_photo']:
+        await callback.message.answer_photo(photo=data['bp_photo'], caption=text, reply_markup=kb)
+        await callback.message.delete()
+    else:
+        await callback.message.answer(text, reply_markup=kb)
+        await callback.message.delete()
+        
+    await state.set_state(CreateSeedPack.confirm_save)
+    await callback.answer()
+
+@dp.callback_query(CreateSeedPack.confirm_save, F.data == "sp_draft_save")
+async def cb_adm_sp_save_draft(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    title = data['sp_title']
+    desc = data['sp_desc']
+    photo = data.get('bp_photo') # Используем сохраненное поле фото
+    sp_cards = data.get('sp_cards', {})
+    
+    db = await get_db_connection()
+    try:
+        await db.execute("BEGIN")
+        cursor = await db.execute(
+            "INSERT INTO seed_packs (title, photo_id, description, price) VALUES (?, ?, ?, 2000)",
+            (title, photo, desc)
+        )
+        pack_id = cursor.lastrowid
+        
+        for c_id, chance in sp_cards.items():
+            await db.execute(
+                "INSERT INTO seed_pack_cards (pack_id, card_id, drop_chance) VALUES (?, ?, ?)",
+                (pack_id, c_id, chance)
+            )
+            
+        await db.commit()
+        await callback.message.answer(f"🎉 Сид-Пак «<b>{title}</b>» успешно создан и добавлен в магазин!")
+        await log_admin(callback.from_user.id, f"Создал новый Сид-Пак: {title}")
+    except Exception as e:
+        await db.execute("ROLLBACK")
+        await callback.message.answer(f"❌ Ошибка сохранения Сид-Пака: {e}")
+    finally:
+        await db.close()
+        
+    await state.clear()
+    await callback.message.delete()
+    await callback.answer()
+
+@dp.callback_query(CreateSeedPack.confirm_save, F.data == "sp_draft_cancel")
+async def cb_adm_sp_cancel_draft(callback: types.CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.answer("❌ Создание Сид-Пака отменено.")
+    await callback.message.delete()
+    await callback.answer()
+
+# ========================================================================
+# РЕДАКТИРОВАНИЕ СИД-ПАКОВ (ШУСТРЫЙ ИНТЕРФЕЙС С FSM)
+# ========================================================================
+@dp.callback_query(F.data == "adm_sp_manage_list")
+async def cb_adm_sp_manage_list(callback: types.CallbackQuery, state: FSMContext):
+    packs = await fetch_all("SELECT * FROM seed_packs")
+    if not packs:
+        return await callback.answer("❌ На сервере нет созданных Сид-Паков!", show_alert=True)
+        
+    text = "📝 <b>Выбор Сид-Пака для редактирования:</b>"
+    kb = []
+    for p in packs:
+        kb.append([InlineKeyboardButton(text=f"⚙️ Редактировать: {p['title']}", callback_data=f"sp_edit_pack_id_{p['id']}")])
+        
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_sp_main")])
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sp_edit_pack_id_"))
+async def cb_adm_sp_edit_menu(callback: types.CallbackQuery, state: FSMContext):
+    pack_id = int(callback.data.split("_")[4])
+    pack = await fetch_one("SELECT * FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not pack:
+        return await callback.answer("❌ Сид-пак не найден!", show_alert=True)
+        
+    pack_cards = await fetch_all("""
+        SELECT c.name, spc.card_id, spc.drop_chance 
+        FROM seed_pack_cards spc 
+        JOIN cards c ON spc.card_id = c.id 
+        WHERE spc.pack_id = ?
+    """, (pack_id,))
+    
+    text = (
+        f"⚙️ <b>РЕДАКТИРОВАНИЕ: {pack['title']}</b>\n"
+        f"💬 Описание: <i>{pack['description'] or 'Отсутствует'}</i>\n"
+        f"💵 Цена в магазине: <b>{pack['price']} Шекелей</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Содержимое пака:</b>\n"
+    )
+    
+    if not pack_cards:
+        text += "  └ <i>Пак пуст!</i>\n"
+    else:
+        total_w = sum(c['drop_chance'] for c in pack_cards)
+        for idx, c in enumerate(pack_cards, 1):
+            chance_pct = (c['drop_chance'] / total_w) * 100 if total_w > 0 else 0
+            text += f"  {idx}. {c['name']} (Вес: {c['drop_chance']} | ~{chance_str := f'{real_chance:.2f}%' if (real_chance := (c['drop_chance']/total_w)*100 if total_w > 0 else 0) else '0%'}%)\n"
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Название", callback_data=f"sp_edval_title_{pack_id}"),
+         InlineKeyboardButton(text="✏️ Описание", callback_data=f"sp_edval_desc_{pack_id}")],
+        [InlineKeyboardButton(text="✏️ Фото", callback_data=f"sp_edval_photo_{pack_id}"),
+         InlineKeyboardButton(text="➕ Добавить юнита", callback_data=f"sp_edval_addcard_{pack_id}")],
+        [InlineKeyboardButton(text="⚙️ Изменить шансы / Удалить юнитов", callback_data=f"sp_edval_cards_list_{pack_id}")],
+        [InlineKeyboardButton(text="🗑 УДАЛИТЬ СИД-ПАК ПОЛНОСТЬЮ", callback_data=f"sp_edval_delete_pack_{pack_id}")],
+        [InlineKeyboardButton(text="🔙 Назад к списку", callback_data="adm_sp_manage_list")]
+    ])
+    
+    await state.update_data(editing_pack_id=pack_id)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await state.set_state(EditSeedPack.menu)
+    await callback.answer()
+
+@dp.callback_query(EditSeedPack.menu, F.data.startswith("sp_edval_"))
+async def cb_sp_edit_field(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    field = parts[2]
+    pack_id = int(parts[3])
+    
+    if field == "title":
+        await callback.message.answer("Введите НОВОЕ название для Сид-Пака:")
+        await state.set_state(EditSeedPack.edit_title)
+    elif field == "desc":
+        await callback.message.answer("Введите НОВОЕ описание для Сид-Пака:")
+        await state.set_state(EditSeedPack.edit_description)
+    elif field == "photo":
+        kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить (Удалить фото)")]], resize_keyboard=True)
+        await callback.message.answer("Отправьте новое ФОТО для Сид-Пака (или нажмите кнопку снизу):", reply_markup=kb)
+        await state.set_state(EditSeedPack.edit_photo)
+    elif field == "addcard":
+        all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+        items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"} for c in all_cards]
+        await state.update_data(add_card_items=items)
+        kb = get_pagination_keyboard(items, 0, "sp_ed_addc", columns=1, items_per_page=6)
+        kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 В меню редактирования", callback_data=f"sp_edit_pack_id_{pack_id}")])
+        await callback.message.edit_text("Выберите карту из базы данных для добавления в Сид-Пак:", reply_markup=kb)
+        await state.set_state(EditSeedPack.add_card_select)
+    elif field == "cards_list":
+        await cq_sp_edit_manage_cards(callback, state, pack_id)
+    elif field == "delete_pack":
+        await cq_sp_edit_delete_pack(callback, pack_id)
+        
+    await callback.answer()
+
+# Сохранение текстовых полей сид пака
+@dp.message(EditSeedPack.edit_title)
+async def adm_sp_edit_title_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pack_id = data['editing_pack_id']
+    new_title = message.text.strip()
+    
+    await execute_db("UPDATE seed_packs SET title = ? WHERE id = ?", (new_title, pack_id))
+    await log_admin(message.from_user.id, f"Сид-Пак {pack_id} новое название: {new_title}")
+    
+    await message.answer("✅ Название успешно обновлено!")
+    # Возвращаемся в меню
+    fake_call = types.CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data=f"sp_edit_pack_id_{pack_id}")
+    await cb_adm_sp_edit_menu(fake_call, state)
+
+@dp.message(EditSeedPack.edit_description)
+async def adm_sp_edit_desc_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pack_id = data['editing_pack_id']
+    new_desc = message.text.strip()
+    
+    await execute_db("UPDATE seed_packs SET description = ? WHERE id = ?", (new_desc, pack_id))
+    await log_admin(message.from_user.id, f"Сид-Пак {pack_id} новое описание: {new_desc}")
+    
+    await message.answer("✅ Описание успешно обновлено!")
+    fake_call = types.CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data=f"sp_edit_pack_id_{pack_id}")
+    await cb_adm_sp_edit_menu(fake_call, state)
+
+@dp.message(EditSeedPack.edit_photo)
+async def adm_sp_edit_photo_save(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    pack_id = data['editing_pack_id']
+    
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+        await message.answer("✅ Фото Сид-Пака успешно обновлено!", reply_markup=ReplyKeyboardRemove())
+    else:
+        await message.answer("✅ Фото удалено из Сид-Пака!", reply_markup=ReplyKeyboardRemove())
+        
+    await execute_db("UPDATE seed_packs SET photo_id = ? WHERE id = ?", (photo_id, pack_id))
+    fake_call = types.CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data=f"sp_edit_pack_id_{pack_id}")
+    await cb_adm_sp_edit_menu(fake_call, state)
+
+# Добавление карт в существующий сид-пак
+@dp.callback_query(EditSeedPack.add_card_select, F.data.startswith("sp_ed_addc_page_"))
+async def cb_sp_edit_add_card_paginate(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[4])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('add_card_items', []), page, "sp_ed_addc", columns=1, items_per_page=6)
+    pack_id = data['editing_pack_id']
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 В меню редактирования", callback_data=f"sp_edit_pack_id_{pack_id}")])
+    try: await callback.message.edit_reply_markup(reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(EditSeedPack.add_card_select, F.data.startswith("sp_ed_addc_"))
+async def cb_sp_edit_add_card_select(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[3])
+    
+    card_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (card_id,))
+    if not card_info: return await callback.answer("Карта не найдена!", show_alert=True)
+    
+    await state.update_data(edit_add_card_id=card_id)
+    await callback.message.answer(f"Введите шанс выпадения (вес) для карты <b>{card_info['name']}</b>:")
+    await state.set_state(EditSeedPack.add_card_chance)
+    await callback.answer()
+
+@dp.message(EditSeedPack.add_card_chance)
+async def adm_sp_edit_add_card_chance_save(message: types.Message, state: FSMContext):
+    try:
+        chance = float(message.text.replace(',', '.'))
+        if chance <= 0: raise ValueError
+        
+        data = await state.get_data()
+        pack_id = data['editing_pack_id']
+        card_id = data['edit_add_card_id']
+        
+        await execute_db(
+            "INSERT INTO seed_pack_cards (pack_id, card_id, drop_chance) VALUES (?, ?, ?) "
+            "ON CONFLICT(pack_id, card_id) DO UPDATE SET drop_chance = ?",
+            (pack_id, card_id, chance, chance)
+        )
+        
+        await message.answer("✅ Карта успешно добавлена / обновлена в Сид-Паке!")
+        fake_call = types.CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data=f"sp_edit_pack_id_{pack_id}")
+        await cb_adm_sp_edit_menu(fake_call, state)
+    except:
+        await message.answer("❌ Введите положительное число.")
+
+# Изменение и удаление существующих карт в паке
+async def cq_sp_edit_manage_cards(callback: types.CallbackQuery, state: FSMContext, pack_id: int):
+    pack_cards = await fetch_all("""
+        SELECT c.name, spc.card_id, spc.drop_chance 
+        FROM seed_pack_cards spc 
+        JOIN cards c ON spc.card_id = c.id 
+        WHERE spc.pack_id = ?
+    """, (pack_id,))
+    
+    if not pack_cards:
+        return await callback.answer("❌ В Сид-Паке нет карт для настройки!", show_alert=True)
+        
+    text = "⚙️ <b>Выберите карту для настройки шанса или удаления:</b>"
+    kb = []
+    for c in pack_cards:
+        kb.append([
+            InlineKeyboardButton(text=f"✏️ {c['name']} ({c['drop_chance']})", callback_data=f"sp_cact_edit_{pack_id}_{c['card_id']}"),
+            InlineKeyboardButton(text=f"🗑 Удалить", callback_data=f"sp_cact_del_{pack_id}_{c['card_id']}")
+        ])
+    kb.append([InlineKeyboardButton(text="🔙 В меню редактирования", callback_data=f"sp_edit_pack_id_{pack_id}")])
+    
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(EditSeedPack.menu, F.data.startswith("sp_cact_"))
+async def cb_sp_edit_card_action(callback: types.CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    action = parts[2]
+    pack_id = int(parts[3])
+    card_id = int(parts[4])
+    
+    if action == "del":
+        await execute_db("DELETE FROM seed_pack_cards WHERE pack_id = ? AND card_id = ?", (pack_id, card_id))
+        await callback.answer("✅ Юнит удален из Сид-Пака!", show_alert=True)
+        await cq_sp_edit_manage_cards(callback, state, pack_id)
+    elif action == "edit":
+        card_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (card_id,))
+        await state.update_data(edit_chance_card_id=card_id)
+        await callback.message.answer(f"Введите новое значение шанса (веса) для карты <b>{card_info['name']}</b>:")
+        await state.set_state(EditSeedPack.card_edit_chance)
+        await callback.answer()
+
+@dp.message(EditSeedPack.card_edit_chance)
+async def adm_sp_edit_card_chance_save(message: types.Message, state: FSMContext):
+    try:
+        chance = float(message.text.replace(',', '.'))
+        if chance <= 0: raise ValueError
+        
+        data = await state.get_data()
+        pack_id = data['editing_pack_id']
+        card_id = data['edit_chance_card_id']
+        
+        await execute_db("UPDATE seed_pack_cards SET drop_chance = ? WHERE pack_id = ? AND card_id = ?", (chance, pack_id, card_id))
+        await message.answer("✅ Шанс успешно изменен!")
+        fake_call = types.CallbackQuery(id="0", from_user=message.from_user, chat_instance="0", message=message, data=f"sp_edit_pack_id_{pack_id}")
+        await cb_adm_sp_edit_menu(fake_call, state)
+    except:
+        await message.answer("❌ Введите положительное число.")
+
+# Полное удаление Сид-Пака
+async def cq_sp_edit_delete_pack(callback: types.CallbackQuery, pack_id: int):
+    pack_info = await fetch_one("SELECT title FROM seed_packs WHERE id = ?", (pack_id,))
+    name = pack_info['title'] if pack_info else f"ID {pack_id}"
+    
+    await execute_db("DELETE FROM seed_packs WHERE id = ?", (pack_id,))
+    await execute_db("DELETE FROM seed_pack_cards WHERE pack_id = ?", (pack_id,))
+    await execute_db("DELETE FROM user_seed_packs WHERE pack_id = ?", (pack_id,))
+    
+    await log_admin(callback.from_user.id, f"Удалил полностью Сид-Пак: {name}")
+    await callback.answer(f"✅ Сид-Пак «{name}» полностью удален!", show_alert=True)
+    await cb_adm_sp_manage_list(callback, None)
+
+
+# ========================================================================
 # ЗАПУСК БОТА И ФОНОВЫХ ЗАДАЧ
 # ========================================================================
 async def main():
@@ -3897,14 +4877,13 @@ async def main():
         BotCommand(command="inventory", description="Инвентарь"),
         BotCommand(command="equip", description="Экипировка колоды"),
         BotCommand(command="profile", description="Профиль и статы"),
-        BotCommand(command="trade", description="Обменяться картами"),
         BotCommand(command="quests", description="Квесты"),
         BotCommand(command="index", description="Индекс всех карт"),
         BotCommand(command="top", description="Рейтинг игроков")
     ]
     await bot.set_my_commands(commands)
     
-    logging.info("🤖 Карточный бот запущен (Батл-пасс + Кошмар + UI Rework + Сигны + Трейды + Настройки)!")
+    logging.info("🤖 Карточный бот запущен (Батл-пасс + Кошмар + UI Rework + Сигны + Сид-Паки + Ивенты)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
@@ -3913,3 +4892,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен.")
+        
