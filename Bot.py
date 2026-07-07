@@ -4543,8 +4543,9 @@ async def cb_adm_sp_finish_draft(callback: types.CallbackQuery, state: FSMContex
         [InlineKeyboardButton(text="❌ Отменить", callback_data="sp_draft_cancel")]
     ])
     
-    if data['bp_photo']:
-        await callback.message.answer_photo(photo=data['bp_photo'], caption=text, reply_markup=kb)
+    # Исправлен баг: поиск правильного поля фото (sp_photo вместо bp_photo)
+    if data.get('sp_photo'):
+        await callback.message.answer_photo(photo=data['sp_photo'], caption=text, reply_markup=kb)
         await callback.message.delete()
     else:
         await callback.message.answer(text, reply_markup=kb)
@@ -4558,7 +4559,8 @@ async def cb_adm_sp_save_draft(callback: types.CallbackQuery, state: FSMContext)
     data = await state.get_data()
     title = data['sp_title']
     desc = data['sp_desc']
-    photo = data.get('bp_photo') # Используем сохраненное поле фото
+    # Исправлен баг: поиск правильного поля фото
+    photo = data.get('sp_photo')
     sp_cards = data.get('sp_cards', {})
     
     db = await get_db_connection()
@@ -4642,7 +4644,7 @@ async def cb_adm_sp_edit_menu(callback: types.CallbackQuery, state: FSMContext):
         total_w = sum(c['drop_chance'] for c in pack_cards)
         for idx, c in enumerate(pack_cards, 1):
             chance_pct = (c['drop_chance'] / total_w) * 100 if total_w > 0 else 0
-            text += f"  {idx}. {c['name']} (Вес: {c['drop_chance']} | ~{chance_str := f'{real_chance:.2f}%' if (real_chance := (c['drop_chance']/total_w)*100 if total_w > 0 else 0) else '0%'}%)\n"
+            text += f"  {idx}. {c['name']} (Вес: {c['drop_chance']} | ~{chance_pct:.2f}%)\n"
             
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✏️ Название", callback_data=f"sp_edval_title_{pack_id}"),
@@ -4854,6 +4856,191 @@ async def cq_sp_edit_delete_pack(callback: types.CallbackQuery, pack_id: int):
 
 
 # ========================================================================
+# ПЕРЕОПРЕДЕЛЕНИЕ ФУНКЦИЙ ГАЧИ И ИНДЕКСА ДЛЯ ИЗОЛЯЦИИ СИД-ПАКОВ
+# Эти функции переопределят старые версии из Первой части файла
+# ========================================================================
+async def calculate_chance_weights(luck_mult: float = 1.0):
+    # Карты из Сид-Паков больше не участвуют в обычной гаче
+    all_cards = await fetch_all("""
+        SELECT * FROM cards 
+        WHERE drop_chance > 0 
+        AND rarity != 'Leaderboard'
+        AND id NOT IN (SELECT card_id FROM seed_pack_cards)
+    """)
+    if not all_cards: return [], 0
+    total_weight = 0
+    weights_dict = {}
+    for c in all_cards:
+        weight = c['drop_chance']
+        if weight < 15.0: weight *= luck_mult
+        weights_dict[c['id']] = weight
+        total_weight += weight
+    return weights_dict, total_weight
+
+async def give_multiple_cards(user_id: int, count: int) -> list:
+    luck_mult, _ = await get_active_events()
+    user = await fetch_one("SELECT pity_mythic, pity_super FROM users WHERE id=?", (user_id,))
+    pm = user['pity_mythic']
+    ps = user['pity_super']
+
+    # Карты из Сид-Паков больше не участвуют в обычной гаче
+    all_cards = await fetch_all("""
+        SELECT * FROM cards 
+        WHERE drop_chance > 0 
+        AND rarity != 'Leaderboard'
+        AND id NOT IN (SELECT card_id FROM seed_pack_cards)
+    """)
+    if not all_cards: return []
+    
+    super_cards = [c for c in all_cards if c['rarity'] == 'Super']
+    mythic_cards = [c for c in all_cards if c['rarity'] == 'Mythic']
+    weights = [c['drop_chance'] * (luck_mult if c['drop_chance'] < 15.0 else 1.0) for c in all_cards]
+    
+    results = []
+    for _ in range(count):
+        card = random.choices(all_cards, weights=weights, k=1)[0]
+        is_pity = False
+        p_type = None
+
+        if ps + 1 >= 10000 and card['rarity'] != 'Super' and super_cards:
+            card = random.choice(super_cards)
+            is_pity = True
+            p_type = 'Super'
+        elif pm + 1 >= 1000 and card['rarity'] not in ['Mythic', 'Super'] and mythic_cards:
+            card = random.choice(mythic_cards)
+            is_pity = True
+            p_type = 'Mythic'
+
+        if card['rarity'] == 'Super': 
+            ps = 0; pm += 1
+        elif card['rarity'] == 'Mythic': 
+            pm = 0; ps += 1
+        else: 
+            ps += 1; pm += 1
+
+        mut = roll_mutation()
+        _, serial, _ = await give_card_to_user(user_id, card['id'], mut, card['rarity'])
+
+        c_copy = dict(card)
+        c_copy['mutation'] = mut
+        c_copy['serial_number'] = serial
+        c_copy['is_pity'] = is_pity
+        c_copy['pity_type'] = p_type
+        c_copy['signed_by'] = 0
+        results.append(c_copy)
+
+    await execute_db("UPDATE users SET pity_mythic=?, pity_super=? WHERE id=?", (pm, ps, user_id))
+    return results
+
+# Единый индекс, в котором карты из Сид-Паков отображаются в общем списке с подписью пака
+async def get_index_text(user_id: int, page: int = 0, items_per_page: int = 8):
+    all_cards = await fetch_all("SELECT * FROM cards")
+    user_inv = await fetch_all("SELECT DISTINCT card_id FROM inventory WHERE user_id = ?", (user_id,))
+    user_card_ids = [item['card_id'] for item in user_inv]
+    
+    if not all_cards: return "Индекс пуст.", None
+    
+    luck_mult, _ = await get_active_events()
+    weights_dict, total_w = await calculate_chance_weights(luck_mult)
+    
+    # Получаем информацию о картах из сид-паков
+    pack_cards = await fetch_all("""
+        SELECT spc.card_id, spc.drop_chance as pack_chance, sp.title
+        FROM seed_pack_cards spc
+        JOIN seed_packs sp ON spc.pack_id = sp.id
+    """)
+    pack_info = {pc['card_id']: pc for pc in pack_cards}
+    
+    # Считаем сумму весов для каждого пака для вычисления правильных процентов
+    pack_totals = {}
+    for pc in pack_cards:
+        w = pc['pack_chance']
+        if w < 15.0: w *= luck_mult
+        pack_totals[pc['title']] = pack_totals.get(pc['title'], 0) + w
+    
+    def index_sort_key(c):
+        if c['rarity'] == 'Leaderboard': return -1
+        # Карты из паков сортируем после обычных, либо по их шансам
+        if c['id'] in pack_info:
+            return pack_info[c['id']]['pack_chance'] + 10000 
+        return weights_dict.get(c['id'], 9999)
+        
+    all_cards.sort(key=index_sort_key)
+    
+    total_pages = max(1, math.ceil(len(all_cards) / items_per_page))
+    page = max(0, min(page, total_pages - 1))
+    
+    text = f"📖 <b>МИРОВОЙ ИНДЕКС КАРТ (Стр. {page+1}/{total_pages})</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    if luck_mult > 1.0: text += f"🍀 <b>ИВЕНТ УДАЧИ АКТИВЕН (x{luck_mult})! Шансы пересчитаны!</b>\n\n"
+    
+    start_idx = page * items_per_page
+    end_idx = start_idx + items_per_page
+    page_items = all_cards[start_idx:end_idx]
+    
+    for i, c in enumerate(page_items, start_idx + 1):
+        inv_stats = await fetch_all("SELECT mutation, SUM(count) as c FROM inventory WHERE card_id = ? AND user_id != ? GROUP BY mutation", (c['id'], SUPER_ADMIN_ID))
+        total_exists = sum(item['c'] for item in inv_stats if item['c'])
+        
+        mut_texts = []
+        for st in inv_stats:
+            if st['mutation'] == 'Gold' and st['c'] > 0: mut_texts.append(f"⭐ Золотых: {st['c']}")
+            if st['mutation'] == 'Rainbow' and st['c'] > 0: mut_texts.append(f"🌈 Радужных: {st['c']}")
+            
+        mut_str = f"\n      └ <i>Из них: {', '.join(mut_texts)}</i>" if mut_texts else ""
+        
+        n_fmt = format_card_name(c).replace(" <b>[#-001]</b>", "")
+        r_fmt = format_rarity_display(c['rarity'])
+        
+        # Определяем как выводить шанс в зависимости от того, откуда падает карта
+        if c['id'] in pack_info:
+            p_info = pack_info[c['id']]
+            p_title = p_info['title']
+            p_weight = p_info['pack_chance']
+            if p_weight < 15.0: p_weight *= luck_mult
+            p_total = pack_totals.get(p_title, 1)
+            real_chance = (p_weight / p_total) * 100 if p_total > 0 else 0
+            chance_str = f"Шанс: {real_chance:.2f}% <b>(Пак «{p_title}»)</b>"
+        elif c['rarity'] == 'Leaderboard':
+            chance_str = "Только за Топ!"
+        else:
+            real_chance = (weights_dict.get(c['id'], 0) / total_w) * 100 if total_w > 0 else 0
+            chance_str = f"Шанс из Гачи: {real_chance:.4f}%"
+        
+        if c['id'] in user_card_ids:
+            text += f"{i}. {n_fmt}\n      └ 💎 {r_fmt} ({chance_str})\n"
+            if c['class_type'] == 'Booster': text += f"      └ ✨ Бафф: DMG x{c['booster_dmg_mult']} // HP x{c['booster_hp_mult']}\n"
+            else: text += f"      └ ⚔️ Урон: {c['damage']} // ❤️ Здоровье: {c['hp']}\n"
+            text += f"      └ 🌍 Существует: {total_exists} шт.{mut_str}\n\n"
+        else:
+            text += f"{i}. <b>???</b> (Не открыто)\n      └ 💎 {r_fmt} ({chance_str})\n"
+            text += f"      └ 🌍 Существует: {total_exists} шт.{mut_str}\n\n"
+            
+    kb = []
+    nav_row = []
+    if page > 0: nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"idx_page_{page-1}"))
+    if total_pages > 1: nav_row.append(InlineKeyboardButton(text=f"{page+1}/{total_pages}", callback_data="ignore"))
+    if page < total_pages - 1: nav_row.append(InlineKeyboardButton(text="Вперед ➡️", callback_data=f"idx_page_{page+1}"))
+    if nav_row: kb.append(nav_row)
+    
+    return text, InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+# Переопределяем хендлеры индекса, чтобы убрать лишнее меню категорий
+@dp.message(Command("index"))
+@dp.message(F.text.in_(BTN_IDX))
+async def cmd_index(message: types.Message):
+    if await check_ban(message.from_user.id): return
+    text, kb = await get_index_text(message.from_user.id, 0)
+    await message.answer(text, reply_markup=kb)
+    
+@dp.callback_query(F.data.startswith("idx_page_"))
+async def callback_index_page(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[2])
+    text, kb = await get_index_text(callback.from_user.id, page)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+
+# ========================================================================
 # ЗАПУСК БОТА И ФОНОВЫХ ЗАДАЧ
 # ========================================================================
 async def main():
@@ -4870,6 +5057,7 @@ async def main():
     asyncio.create_task(leaderboard_rewards_task())
     asyncio.create_task(trade_timeout_task())
     
+    # Добавлена команда /trade в меню телеграма
     commands = [
         BotCommand(command="start", description="Главное меню"),
         BotCommand(command="getcard", description="Выбить карту (Гача)"),
@@ -4877,6 +5065,7 @@ async def main():
         BotCommand(command="inventory", description="Инвентарь"),
         BotCommand(command="equip", description="Экипировка колоды"),
         BotCommand(command="profile", description="Профиль и статы"),
+        BotCommand(command="trade", description="Обменяться картами"),
         BotCommand(command="quests", description="Квесты"),
         BotCommand(command="index", description="Индекс всех карт"),
         BotCommand(command="top", description="Рейтинг игроков")
@@ -4892,4 +5081,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         print("Бот остановлен.")
-        
