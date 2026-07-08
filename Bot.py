@@ -2503,7 +2503,7 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
     elif is_pvp and winner == p2_name: winner_user_id = p2_id
 
     if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-        if random.random() <= 0.0025:
+        if random.random() <= 0.006:
             db = await get_db_connection()
             try:
                 async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 LIMIT 1") as cursor:
