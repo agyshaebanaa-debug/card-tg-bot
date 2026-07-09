@@ -103,6 +103,7 @@ active_trades = {}
 user_trades = {}    
 pvp_queue = set()
 active_manual_battles = {} # Для ручного режима
+surrendered_players = set() # Множество игроков, которые нажали "Сдаться"
 
 SHOP_PACKAGES = [
     ("1_rnd", "1 Случайная карта", "1 Random Card", 100, 20, 1.0),
@@ -1844,6 +1845,16 @@ async def cmd_equip(message: types.Message):
             
     await message.answer(loc(lang, "🛡 <b>БОЕВАЯ КОЛОДА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите слот:", "🛡 <b>BATTLE DECK</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nChoose a slot:"), reply_markup=get_equip_main_keyboard(user, cards_info, lang))
 
+@dp.callback_query(F.data == "eq_clear")
+async def cb_eq_clear(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (user_id,))
+    lang = user['lang'] if user else 'ru'
+    
+    await execute_db("UPDATE users SET equip1 = 0, equip2 = 0, equip3 = 0, equip4 = 0 WHERE id = ?", (user_id,))
+    await callback.message.edit_text(loc(lang, "✅ Боевая колода успешно очищена!", "✅ Battle deck successfully cleared!"))
+    await callback.answer()
+
 @dp.callback_query(F.data.startswith("eq_select_"))
 async def equip_slot_callback(callback: types.CallbackQuery, state: FSMContext):
     slot_num = int(callback.data.split("_")[2])
@@ -2497,9 +2508,15 @@ async def player_manual_turn(chat_id, p1_id, t1, t2, lang):
     ev = asyncio.Event()
     active_manual_battles[chat_id] = {'p1_id': p1_id, 't1': t1, 't2': t2, 'event': ev, 'attacker_idx': None, 'target_idx': None, 'step': 'atk'}
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"🗡 {c['name']} (❤️{c['hp']})", callback_data=f"manatk_{i}")] for i, c in enumerate(t1) if c['hp'] > 0
-    ])
+    kb_btns = []
+    for i, c in enumerate(t1):
+        if c['hp'] > 0:
+            is_heal = (c['class_type'] == 'Healer')
+            stat_val = int((c['damage'] + c.get('dmg_buff', 0)) * c.get('heal_power_mult', 1.0)) if is_heal else (c['damage'] + c.get('dmg_buff', 0))
+            icon = "💗" if is_heal else "⚔️"
+            kb_btns.append([InlineKeyboardButton(text=f"{icon} {c['name']} ({icon}{stat_val} | ❤️{c['hp']})", callback_data=f"manatk_{i}")])
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_btns)
     msg = await bot.send_message(chat_id, loc(lang, "⏳ <b>Ваш ход!</b> Выберите карту для действия (12 сек):", "⏳ <b>Your turn!</b> Select card (12s):"), reply_markup=kb)
 
     try:
@@ -2539,10 +2556,13 @@ async def cb_man_atk(callback: types.CallbackQuery):
     is_heal = (atk['class_type'] == 'Healer')
     target_team = t1 if is_heal else t2
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"{'💗' if is_heal else '🎯'} {c['name']} (❤️{c['hp']})", callback_data=f"mantgt_{i}")]
-        for i, c in enumerate(target_team) if c['hp'] > 0
-    ])
+    kb_btns = []
+    for i, c in enumerate(target_team):
+        if c['hp'] > 0:
+            dmg_val = (c['damage'] + c.get('dmg_buff', 0))
+            kb_btns.append([InlineKeyboardButton(text=f"{'💗' if is_heal else '🎯'} {c['name']} (⚔️{dmg_val} | ❤️{c['hp']})", callback_data=f"mantgt_{i}")])
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_btns)
     await callback.message.edit_text(f"Выбран: <b>{atk['name']}</b>\nВыберите цель:", reply_markup=kb)
     await callback.answer()
 
@@ -2564,7 +2584,29 @@ async def do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, 
     else:
         did_turn, heals = await execute_turn(t1, t2, p1_name, p2_name, log, None, lang, lang)
     return did_turn, heals
+
 # -----------------------------
+# КНОПКА СДАТЬСЯ
+@dp.callback_query(F.data == "surrender_battle")
+async def cb_surrender_battle(callback: types.CallbackQuery):
+    if callback.from_user.id in active_combats:
+        surrendered_players.add(callback.from_user.id)
+        await callback.answer("🏳️ Вы сдались!", show_alert=True)
+    else:
+        await callback.answer("Вы не в бою!", show_alert=True)
+
+def get_battle_kb(lang="ru"):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=loc(lang, "🏳️ Сдаться", "🏳️ Surrender"), callback_data="surrender_battle")]
+    ])
+
+# Умная задержка (мгновенно прерывается, если кто-то нажал "сдаться")
+async def battle_delay(*p_ids, delay=3.0):
+    steps = int(delay * 10)
+    for _ in range(steps):
+        await asyncio.sleep(0.1)
+        if any(pid in surrendered_players for pid in p_ids if pid):
+            break
 
 async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
     msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
@@ -2579,8 +2621,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
     apply_boosters(t2, p2_name, log, None, lang, lang)
     
     if log:
-        await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
-        await asyncio.sleep(3)
+        await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+        await battle_delay(p1_id, p2_id)
 
     turn = 1
     winner = None
@@ -2591,6 +2633,13 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
     while True:
         if time.time() - battle_start_time > 180:
             timeout_flag = True
+            break
+            
+        # Проверка кнопки сдаться
+        if p1_id in surrendered_players:
+            winner = p2_name; winner_id = p2_id; loser_id = p1_id
+            surrendered_players.discard(p1_id)
+            log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
             break
 
         t1_alive = [c for c in t1 if c['hp'] > 0]
@@ -2611,8 +2660,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
         p1_total_heals += heals
         if did_turn:
             if len(log) > 6: log = log[-6:]
-            await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
-            await asyncio.sleep(3)
+            await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+            await battle_delay(p1_id, p2_id)
 
         # Модификатор: ИИ атакует каждый ход
         if mods and mods.get('mod_enemy_atk_all') and not is_pvp and [c for c in t2 if c['hp']>0] and [c for c in t1 if c['hp']>0]:
@@ -2620,8 +2669,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             p2_total_heals += heals_e
             if did_turn_e:
                 if len(log) > 6: log = log[-6:]
-                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
-                await asyncio.sleep(3)
+                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                await battle_delay(p1_id, p2_id)
 
         t2_alive = [c for c in t2 if c['hp'] > 0]
         if t2_alive:
@@ -2634,8 +2683,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             p2_total_heals += heals_e
             if did_turn_e:
                 if len(log) > 6: log = log[-6:]
-                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
-                await asyncio.sleep(3)
+                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                await battle_delay(p1_id, p2_id)
                 
             # Модификатор: Игрок атакует каждый ход
             if mods and mods.get('mod_player_atk_all') and not is_pvp and [c for c in t1 if c['hp']>0] and [c for c in t2 if c['hp']>0]:
@@ -2643,8 +2692,8 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
                 p1_total_heals += heals
                 if did_turn:
                     if len(log) > 6: log = log[-6:]
-                    await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
-                    await asyncio.sleep(3)
+                    await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                    await battle_delay(p1_id, p2_id)
         turn += 1
 
     if timeout_flag:
@@ -2665,17 +2714,18 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
         await add_quest_progress(p1_id, 'q_battles', 1)
         if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
 
-    # Логика выпадения уникального кода-награды (ШАНС 1%)
+    # Логика выпадения уникального кода-награды (ШАНС 4%)
     code_text = ""
     winner_user_id = None
     if winner == p1_name: winner_user_id = p1_id
     elif is_pvp and winner == p2_name: winner_user_id = p2_id
 
     if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-        if random.random() <= 0.01:
+        if random.random() <= 0.04:
             db = await get_db_connection()
             try:
-                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 LIMIT 1") as cursor:
+                # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
+                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
                     row = await cursor.fetchone()
                     if row:
                         code_val = row['code']
@@ -2747,7 +2797,7 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             final_text += f"🎫 +{bp_xp} BP XP"
             if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
             
-    await msg.edit_text(final_text)
+    await msg.edit_text(final_text, reply_markup=None)
     for b_msg in bp_messages:
         try: await bot.send_message(p1_id, b_msg)
         except: pass
@@ -2987,8 +3037,9 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     if log1:
         header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
         header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
-        await msg1.edit_text(header1); await msg2.edit_text(header2)
-        await asyncio.sleep(3)
+        await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
+        await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
+        await battle_delay(p1_id, p2_id)
 
     turn = 1
     winner = None
@@ -2998,6 +3049,24 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     while True:
         if time.time() - battle_start_time > 180:
             timeout_flag = True
+            break
+            
+        # Проверка сдающихся
+        if p1_id in surrendered_players and p2_id in surrendered_players:
+            winner = "Draw"
+            surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
+            break
+        elif p1_id in surrendered_players:
+            winner = p2_name
+            surrendered_players.discard(p1_id)
+            log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+            log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+            break
+        elif p2_id in surrendered_players:
+            winner = p1_name
+            surrendered_players.discard(p2_id)
+            log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
+            log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
             break
 
         t1_a = [c for c in t1 if c['hp'] > 0]
@@ -3011,27 +3080,27 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
         p1_heals += h
         if did_turn:
             if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-            try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1))
+            try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
             except: pass
-            try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2))
+            try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
             except: pass
-            await asyncio.sleep(3)
+            await battle_delay(p1_id, p2_id)
 
         t2_a = [c for c in t2 if c['hp'] > 0]
         if t2_a:
             if time.time() - battle_start_time > 180:
                 timeout_flag = True
                 break
-
+                
             did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
             p2_heals += h
             if did_turn:
                 if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-                try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1))
+                try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
                 except: pass
-                try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2))
+                try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
                 except: pass
-                await asyncio.sleep(3)
+                await battle_delay(p1_id, p2_id)
         turn += 1
 
     if timeout_flag:
@@ -3050,7 +3119,7 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
     if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
 
-    # Логика выпадения уникального кода-награды (шанс 1%)
+    # Логика выпадения уникального кода-награды (шанс 4%)
     code_text_1 = ""
     code_text_2 = ""
     winner_user_id = None
@@ -3060,10 +3129,11 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
         elif winner == p2_name: winner_user_id = p2_id
         
     if winner_user_id is not None:
-        if random.random() <= 0.01:
+        if random.random() <= 0.04:
             db = await get_db_connection()
             try:
-                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 LIMIT 1") as cursor:
+                # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
+                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
                     row = await cursor.fetchone()
                     if row:
                         code_val = row['code']
@@ -3083,9 +3153,9 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
     final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
     
-    try: await msg1.edit_text(final1)
+    try: await msg1.edit_text(final1, reply_markup=None)
     except: pass
-    try: await msg2.edit_text(final2)
+    try: await msg2.edit_text(final2, reply_markup=None)
     except: pass
     
     active_combats.discard(p1_id)
@@ -4827,7 +4897,7 @@ async def adm_bp_finish_and_save(callback: types.CallbackQuery, state: FSMContex
         await db.close()
         
     await callback.message.answer("🎉 Батл-пасс успешно сохранен в базу и доступен игрокам!")
-    await log_admin(callback.fromuser_id, f"Создал новый Батл-пасс: {data['bp_title']}")
+    await log_admin(callback.from_user.id, f"Создал новый Батл-пасс: {data['bp_title']}")
     await state.clear()
 
 # ========================================================================
