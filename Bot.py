@@ -102,6 +102,7 @@ active_combats = set()
 active_trades = {}  
 user_trades = {}    
 pvp_queue = set()
+active_manual_battles = {} # Для ручного режима
 
 SHOP_PACKAGES = [
     ("1_rnd", "1 Случайная карта", "1 Random Card", 100, 20, 1.0),
@@ -209,6 +210,12 @@ async def check_and_update_schema():
             
         try: await db.execute("ALTER TABLE users ADD COLUMN lang TEXT DEFAULT 'ru'")
         except aiosqlite.OperationalError: pass
+        
+        # Модификаторы
+        modifiers = ['mod_enemy_hp', 'mod_enemy_atk_all', 'mod_enemy_stats', 'mod_player_atk_all', 'mod_manual_atk', 'mod_player_hp']
+        for col in modifiers:
+            try: await db.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
+            except aiosqlite.OperationalError: pass
 
         await db.execute("""
             CREATE TABLE IF NOT EXISTS cards (
@@ -668,7 +675,7 @@ async def get_user_rank(trophies: int):
     ranks = await fetch_all("SELECT * FROM ranks ORDER BY min_trophies DESC")
     for r in ranks:
         if trophies >= r['min_trophies']: return r
-    return {"name": "Bronze I", "difficulty_mult": 0.8, "reward_mult": 1.0}
+    return {"name": "Bronze I", "difficulty_mult": 0.8, "reward_mult": 1.0, "rank_idx": len(ranks) - ranks.index(r) - 1}
 
 async def get_active_events():
     settings = await fetch_one("SELECT * FROM server_settings WHERE id = 1")
@@ -1081,11 +1088,49 @@ async def cmd_settings(message: types.Message):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🌐 Language: {'🇷🇺 RU' if lang=='ru' else '🇬🇧 EN'}", callback_data="set_toggle_lang")],
         [InlineKeyboardButton(text=loc(lang, "🛒 Фильтр Магазина", "🛒 Shop Notifications"), callback_data="set_shop_filters")],
+        [InlineKeyboardButton(text=loc(lang, "🧬 Модификаторы боя (PvE)", "🧬 Battle Modifiers (PvE)"), callback_data="set_modifiers")],
         [InlineKeyboardButton(text=loc(lang, f"🎉 Ивенты: {'🔔 Вкл' if user['notif_events'] else '🔕 Выкл'}", f"🎉 Events: {'🔔 On' if user['notif_events'] else '🔕 Off'}"), callback_data="set_toggle_events")],
         [InlineKeyboardButton(text=loc(lang, f"📜 Квесты: {'🔔 Вкл' if user['notif_quests'] else '🔕 Выкл'}", f"📜 Quests: {'🔔 On' if user['notif_quests'] else '🔕 Off'}"), callback_data="set_toggle_quests")],
         [InlineKeyboardButton(text=loc(lang, f"📢 Анонсы: {'🔔 Вкл' if user['notif_announces'] else '🔕 Выкл'}", f"📢 Announces: {'🔔 On' if user['notif_announces'] else '🔕 Off'}"), callback_data="set_toggle_announces")]
     ])
     await message.answer(text, reply_markup=kb)
+
+@dp.callback_query(F.data == "set_modifiers")
+async def cb_modifiers_menu(callback: types.CallbackQuery):
+    user = await fetch_one("SELECT * FROM users WHERE id=?", (callback.from_user.id,))
+    lang = user['lang']
+    
+    def s(val): return "✅ Вкл" if val else "❌ Выкл"
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🔴 1.5x ХП Врагов ({s(user.get('mod_enemy_hp'))})", callback_data="set_mod_enemy_hp")],
+        [InlineKeyboardButton(text=f"🔴 ИИ бьет 2 раза ({s(user.get('mod_enemy_atk_all'))})", callback_data="set_mod_enemy_atk_all")],
+        [InlineKeyboardButton(text=f"🔴 1.2x Статы ИИ ({s(user.get('mod_enemy_stats'))})", callback_data="set_mod_enemy_stats")],
+        [InlineKeyboardButton(text=f"🟢 Игрок бьет 2 раза ({s(user.get('mod_player_atk_all'))})", callback_data="set_mod_player_atk_all")],
+        [InlineKeyboardButton(text=f"🟢 Ручной выбор атаки ({s(user.get('mod_manual_atk'))})", callback_data="set_mod_manual_atk")],
+        [InlineKeyboardButton(text=f"🟢 1.3x ХП Игрока ({s(user.get('mod_player_hp'))})", callback_data="set_mod_player_hp")],
+        [InlineKeyboardButton(text=loc(lang, "🔙 Назад", "🔙 Back"), callback_data="set_main")]
+    ])
+    text = loc(lang,
+        "🧬 <b>МОДИФИКАТОРЫ БОЯ (PvE)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВключите модификаторы для усложнения или упрощения боев с ботами.\n\n"
+        "🔴 <b>Дебаффы</b> повышают награды (монеты, опыт, кубки).\n🟢 <b>Баффы</b> снижают награды (монеты, опыт), кубки не режутся.",
+        "🧬 <b>BATTLE MODIFIERS (PvE)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nToggle modifiers to change AI difficulty.\n\n"
+        "🔴 <b>Debuffs</b> increase rewards (coins, xp, trophies).\n🟢 <b>Buffs</b> decrease rewards (coins, xp)."
+    )
+    try: await callback.message.edit_text(text, reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_mod_"))
+async def cb_mod_toggle(callback: types.CallbackQuery):
+    mod = callback.data.replace("set_mod_", "")
+    uid = callback.from_user.id
+    user = await fetch_one("SELECT * FROM users WHERE id=?", (uid,))
+    
+    new_val = 1 if not user.get(f"mod_{mod}") else 0
+    await execute_db(f"UPDATE users SET mod_{mod} = ? WHERE id = ?", (new_val, uid))
+    
+    await cb_modifiers_menu(callback)
 
 @dp.callback_query(F.data == "set_shop_filters")
 async def cb_shop_filters(callback: types.CallbackQuery):
@@ -1130,6 +1175,7 @@ async def cb_set_main(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"🌐 Language: {'🇷🇺 RU' if lang=='ru' else '🇬🇧 EN'}", callback_data="set_toggle_lang")],
         [InlineKeyboardButton(text=loc(lang, "🛒 Фильтр Магазина", "🛒 Shop Notifications"), callback_data="set_shop_filters")],
+        [InlineKeyboardButton(text=loc(lang, "🧬 Модификаторы боя (PvE)", "🧬 Battle Modifiers (PvE)"), callback_data="set_modifiers")],
         [InlineKeyboardButton(text=loc(lang, f"🎉 Ивенты: {'🔔 Вкл' if user['notif_events'] else '🔕 Выкл'}", f"🎉 Events: {'🔔 On' if user['notif_events'] else '🔕 Off'}"), callback_data="set_toggle_events")],
         [InlineKeyboardButton(text=loc(lang, f"📜 Квесты: {'🔔 Вкл' if user['notif_quests'] else '🔕 Выкл'}", f"📜 Quests: {'🔔 On' if user['notif_quests'] else '🔕 Off'}"), callback_data="set_toggle_quests")],
         [InlineKeyboardButton(text=loc(lang, f"📢 Анонсы: {'🔔 Вкл' if user['notif_announces'] else '🔕 Выкл'}", f"📢 Announces: {'🔔 On' if user['notif_announces'] else '🔕 Off'}"), callback_data="set_toggle_announces")]
@@ -1594,7 +1640,7 @@ async def cmd_index(message: types.Message):
 @dp.callback_query(F.data.startswith("idx_page_"))
 async def callback_index_page(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
-    text, kb = await get_index_text(callback.fromuser_id, page)
+    text, kb = await get_index_text(callback.from_user.id, page)
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
@@ -2160,38 +2206,41 @@ async def get_bot_team(user_id: int, difficulty_mult: float, rank_name: str, dif
             elif base_rank == "Diamond": pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', []) + by_rarity.get('Leaderboard', [])
             elif base_rank == "Ruby": pool = by_rarity.get('Super', []) + by_rarity.get('Leaderboard', []) + (by_rarity.get('Mythic', []) if r < 0.1 else [])
         else:
-            small_chance = min(0.3, 0.05 * difficulty_mult)
+            # РЕБАЛАНС: Казуальнее ИИ на высоких рангах
             if base_rank == "Bronze":
-                if r < small_chance and 'Rare' in by_rarity: pool = by_rarity['Rare']
-                else: pool = by_rarity.get('Basic', []) + by_rarity.get('Uncommon', [])
+                pool = by_rarity.get('Basic', []) + by_rarity.get('Uncommon', [])
             elif base_rank == "Silver":
-                if r < small_chance and 'Epic' in by_rarity: pool = by_rarity['Epic']
-                else: pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', [])
+                pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', [])
             elif base_rank == "Gold":
-                if r < small_chance and 'Legendary' in by_rarity: pool = by_rarity['Legendary']
-                else: pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', [])
+                pool = by_rarity.get('Rare', []) + (by_rarity.get('Epic', []) if r < 0.3 else [])
             elif base_rank == "Platina":
-                if r < small_chance and 'Mythic' in by_rarity: pool = by_rarity['Mythic']
-                else: pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', [])
+                pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', []) + (by_rarity.get('Legendary', []) if r < 0.1 else [])
             elif base_rank == "Diamond":
-                if r < small_chance and 'Super' in by_rarity: pool = by_rarity['Super']
-                else: pool = by_rarity.get('Legendary', []) + by_rarity.get('Mythic', [])
-            elif base_rank == "Ruby": pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', [])
+                pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.05 else [])
+            elif base_rank == "Ruby":
+                pool = by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.2 else []) + (by_rarity.get('Super', []) if r < 0.02 else [])
         
         if not pool:
             pool = [c for c in all_cards if c['rarity'] != 'Leaderboard']
             if not pool: pool = all_cards
             
-        team_selection.append(random.choice(pool))
+        # Уменьшаем шанс на Хилеров
+        weighted_pool = []
+        for c in pool:
+            weight = 1 if c['class_type'] == 'Healer' else 4
+            weighted_pool.extend([c] * weight)
+            
+        team_selection.append(random.choice(weighted_pool))
         
     team_copies = []
     for c in team_selection:
         c_copy = dict(c)
         c_copy['max_hp'] = c_copy['hp']
         mut_chance = random.random()
+        # Понижены шансы на мутации для ИИ
         if difficulty_mult >= 1.0 or diff_type == "nightmare": 
-            rainbow_prob = min(0.04, 0.015 * difficulty_mult) 
-            gold_prob = min(0.18, 0.07 * difficulty_mult)     
+            rainbow_prob = min(0.02, 0.01 * difficulty_mult) 
+            gold_prob = min(0.12, 0.05 * difficulty_mult)     
             if mut_chance < rainbow_prob: 
                 c_copy['mutation'] = "Rainbow"
                 c_copy['damage'] = int(c_copy['damage'] * 1.2)
@@ -2283,14 +2332,18 @@ async def process_burns(team, team_name, log1, log2, lang1, lang2):
             add_dual_log(log1, log2, lang1, lang2, ru_str, en_str)
             c['burn'] = 0
 
-async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1, lang2):
+async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1, lang2, force_attacker=None, force_target=None):
     await process_burns(atk_team, atk_name, log1, log2, lang1, lang2)
     atk_alive = [c for c in atk_team if c['hp'] > 0]
     def_alive = [c for c in def_team if c['hp'] > 0]
     heals = 0
     if not atk_alive or not def_alive: return False, heals
     
-    atk = random.choice(atk_alive)
+    if force_attacker and force_attacker['hp'] > 0 and force_attacker in atk_alive:
+        atk = force_attacker
+    else:
+        atk = random.choice(atk_alive)
+        
     base_dmg = atk['damage'] + atk.get('dmg_buff', 0)
     c_type = atk['class_type']
     
@@ -2298,7 +2351,9 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
     dead_en = " ☠️ <i>Dead!</i>"
     
     if c_type == "Booster":
-        target = random.choice(def_alive)
+        if force_target and force_target['hp'] > 0 and force_target in def_alive: target = force_target
+        else: target = random.choice(def_alive)
+        
         dmg = max(10, int(target['max_hp'] * 0.1))
         target['hp'] -= dmg
         ru_str = f"🔋 {atk_name}: <b>{atk['name']}</b> пускает заряд в <b>{target['name']}</b> на {dmg}!"
@@ -2309,8 +2364,17 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
     elif c_type == "Healer":
         other_allies = [c for c in atk_alive if c is not atk]
         
-        if other_allies:
+        # Если выбран форсированный таргет (для хилера это должен быть союзник)
+        if force_target and force_target['hp'] > 0 and force_target in atk_alive:
+            target = force_target
+            do_heal = True
+        elif other_allies:
             target = random.choice(other_allies)
+            do_heal = True
+        else:
+            do_heal = False
+            
+        if do_heal:
             curr_mult = atk.get('heal_power_mult', 1.0)
             heal_amount = int(base_dmg * curr_mult)
             
@@ -2325,7 +2389,9 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
             
             atk['heal_power_mult'] = max(0.0, curr_mult - 0.03)
         else:
-            target = random.choice(def_alive)
+            if force_target and force_target['hp'] > 0 and force_target in def_alive: target = force_target
+            else: target = random.choice(def_alive)
+            
             dmg = max(5, int(base_dmg * 0.2))
             target['hp'] -= dmg
             ru_str = f"🎯 {atk_name}: Одинокий Хилер <b>{atk['name']}</b> бьет <b>{target['name']}</b> на {dmg}!"
@@ -2345,7 +2411,9 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
         add_dual_log(log1, log2, lang1, lang2, ru_str, en_str)
         
     elif c_type == "Splash":
-        main_t = random.choice(def_alive)
+        if force_target and force_target['hp'] > 0 and force_target in def_alive: main_t = force_target
+        else: main_t = random.choice(def_alive)
+            
         splash_dmg = int(base_dmg * 0.5)
         ru_str = f"🌊 {atk_name}: <b>{atk['name']}</b> наносит {base_dmg} по <b>{main_t['name']}</b> и {splash_dmg} остальным!"
         en_str = f"🌊 {atk_name}: <b>{atk['name']}</b> hits <b>{main_t['name']}</b> for {base_dmg} and {splash_dmg} splash!"
@@ -2359,7 +2427,9 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
         add_dual_log(log1, log2, lang1, lang2, ru_str, en_str)
         
     elif c_type == "Fire":
-        target = random.choice(def_alive)
+        if force_target and force_target['hp'] > 0 and force_target in def_alive: target = force_target
+        else: target = random.choice(def_alive)
+            
         target['hp'] -= base_dmg
         target['burn'] = target.get('burn', 0) + base_dmg
         ru_str = f"🔥 {atk_name}: <b>{atk['name']}</b> бьет <b>{target['name']}</b> на {base_dmg} и поджигает!"
@@ -2368,7 +2438,9 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
         add_dual_log(log1, log2, lang1, lang2, ru_str, en_str)
         
     else:
-        target = random.choice(def_alive)
+        if force_target and force_target['hp'] > 0 and force_target in def_alive: target = force_target
+        else: target = random.choice(def_alive)
+            
         target['hp'] -= base_dmg
         ru_str = f"🎯 {atk_name}: <b>{atk['name']}</b> наносит {base_dmg} по <b>{target['name']}</b>!"
         en_str = f"🎯 {atk_name}: <b>{atk['name']}</b> deals {base_dmg} to <b>{target['name']}</b>!"
@@ -2377,11 +2449,10 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
         
     return True, heals
 
-async def get_dynamic_trophies(rank_name: str, diff_scale: float = 1.0) -> int:
-    ranks = await fetch_all("SELECT name FROM ranks ORDER BY min_trophies ASC")
-    rank_idx = next((i for i, r in enumerate(ranks) if r['name'] == rank_name), 0)
-    base = max(1, 15 - int((rank_idx / 21) * 14)) 
-    won = random.randint(max(1, base-1), base+1)
+async def get_dynamic_trophies(rank_name: str, rank_idx: int, diff_scale: float = 1.0) -> int:
+    # ИСПРАВЛЕНИЕ: Меньше отнимаем базу, гарантируем минимум 5 кубков на любом ранге (до применения множителя)
+    base = max(5, 18 - int((rank_idx / 25) * 12)) 
+    won = random.randint(base, base+3)
     return int(won * diff_scale)
 
 async def add_bp_xp(user_id: int, xp_to_add: int) -> tuple:
@@ -2417,7 +2488,85 @@ async def add_bp_xp(user_id: int, xp_to_add: int) -> tuple:
     finally:
         await db.close()
 
-async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru"):
+# --- ЛОГИКА РУЧНОГО БОЯ ---
+async def player_manual_turn(chat_id, p1_id, t1, t2, lang):
+    t1_alive = [c for c in t1 if c['hp'] > 0]
+    t2_alive = [c for c in t2 if c['hp'] > 0]
+    if not t1_alive or not t2_alive: return None, None
+
+    ev = asyncio.Event()
+    active_manual_battles[chat_id] = {'p1_id': p1_id, 't1': t1, 't2': t2, 'event': ev, 'attacker_idx': None, 'target_idx': None, 'step': 'atk'}
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗡 {c['name']} (❤️{c['hp']})", callback_data=f"manatk_{i}")] for i, c in enumerate(t1) if c['hp'] > 0
+    ])
+    msg = await bot.send_message(chat_id, loc(lang, "⏳ <b>Ваш ход!</b> Выберите карту для действия (12 сек):", "⏳ <b>Your turn!</b> Select card (12s):"), reply_markup=kb)
+
+    try:
+        await asyncio.wait_for(ev.wait(), timeout=12.0)
+        a_idx = active_manual_battles[chat_id]['attacker_idx']
+        t_idx = active_manual_battles[chat_id]['target_idx']
+        atk = t1[a_idx] if a_idx is not None else None
+        
+        if atk and atk['class_type'] == 'Healer':
+            tgt = t1[t_idx] if t_idx is not None else None
+        else:
+            tgt = t2[t_idx] if t_idx is not None else None
+    except asyncio.TimeoutError:
+        atk = None
+        tgt = None
+    finally:
+        active_manual_battles.pop(chat_id, None)
+        try: await msg.delete()
+        except: pass
+
+    return atk, tgt
+
+@dp.callback_query(F.data.startswith("manatk_"))
+async def cb_man_atk(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    if chat_id not in active_manual_battles or active_manual_battles[chat_id]['p1_id'] != callback.from_user.id:
+        return await callback.answer("Not your turn!", show_alert=True)
+
+    idx = int(callback.data.split("_")[1])
+    active_manual_battles[chat_id]['attacker_idx'] = idx
+    active_manual_battles[chat_id]['step'] = 'tgt'
+
+    t1 = active_manual_battles[chat_id]['t1']
+    t2 = active_manual_battles[chat_id]['t2']
+    atk = t1[idx]
+
+    is_heal = (atk['class_type'] == 'Healer')
+    target_team = t1 if is_heal else t2
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{'💗' if is_heal else '🎯'} {c['name']} (❤️{c['hp']})", callback_data=f"mantgt_{i}")]
+        for i, c in enumerate(target_team) if c['hp'] > 0
+    ])
+    await callback.message.edit_text(f"Выбран: <b>{atk['name']}</b>\nВыберите цель:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("mantgt_"))
+async def cb_man_tgt(callback: types.CallbackQuery):
+    chat_id = callback.message.chat.id
+    if chat_id not in active_manual_battles or active_manual_battles[chat_id]['p1_id'] != callback.from_user.id:
+        return await callback.answer("Not your turn!", show_alert=True)
+
+    idx = int(callback.data.split("_")[1])
+    active_manual_battles[chat_id]['target_idx'] = idx
+    active_manual_battles[chat_id]['event'].set()
+    await callback.answer()
+
+async def do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp):
+    if mods and mods.get('mod_manual_atk') and not is_pvp:
+        atk, tgt = await player_manual_turn(chat_id, p1_id, t1, t2, lang)
+        did_turn, heals = await execute_turn(t1, t2, p1_name, p2_name, log, None, lang, lang, force_attacker=atk, force_target=tgt)
+    else:
+        did_turn, heals = await execute_turn(t1, t2, p1_name, p2_name, log, None, lang, lang)
+    return did_turn, heals
+# -----------------------------
+
+async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
     msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
     await asyncio.sleep(1)
     await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
@@ -2457,12 +2606,22 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
         if turn > 30:
             winner = loc(lang, "Ничья по раундам", "Timeout Draw"); break
 
-        did_turn, heals = await execute_turn(t1, t2, p1_name, p2_name, log, None, lang, lang)
+        # Ход игрока
+        did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
         p1_total_heals += heals
         if did_turn:
             if len(log) > 6: log = log[-6:]
             await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
             await asyncio.sleep(3)
+
+        # Модификатор: ИИ атакует каждый ход
+        if mods and mods.get('mod_enemy_atk_all') and not is_pvp and [c for c in t2 if c['hp']>0] and [c for c in t1 if c['hp']>0]:
+            did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+            p2_total_heals += heals_e
+            if did_turn_e:
+                if len(log) > 6: log = log[-6:]
+                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
+                await asyncio.sleep(3)
 
         t2_alive = [c for c in t2 if c['hp'] > 0]
         if t2_alive:
@@ -2470,12 +2629,22 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
                 timeout_flag = True
                 break
 
-            did_turn, heals = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-            p2_total_heals += heals
-            if did_turn:
+            # Обычный ход ИИ
+            did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+            p2_total_heals += heals_e
+            if did_turn_e:
                 if len(log) > 6: log = log[-6:]
                 await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
                 await asyncio.sleep(3)
+                
+            # Модификатор: Игрок атакует каждый ход
+            if mods and mods.get('mod_player_atk_all') and not is_pvp and [c for c in t1 if c['hp']>0] and [c for c in t2 if c['hp']>0]:
+                did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
+                p1_total_heals += heals
+                if did_turn:
+                    if len(log) > 6: log = log[-6:]
+                    await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log))
+                    await asyncio.sleep(3)
         turn += 1
 
     if timeout_flag:
@@ -2496,14 +2665,14 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
         await add_quest_progress(p1_id, 'q_battles', 1)
         if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
 
-    # Логика выпадения уникального кода-награды (0.25% шанс)
+    # Логика выпадения уникального кода-награды (ШАНС 1%)
     code_text = ""
     winner_user_id = None
     if winner == p1_name: winner_user_id = p1_id
     elif is_pvp and winner == p2_name: winner_user_id = p2_id
 
     if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-        if random.random() <= 0.006:
+        if random.random() <= 0.01:
             db = await get_db_connection()
             try:
                 async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 LIMIT 1") as cursor:
@@ -2532,31 +2701,50 @@ async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_i
             await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
             final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
     else:
+        # Расчет наград с модификаторами
+        mod_reward_mult = 1.0
+        mod_trophy_mult = 1.0
+        if mods:
+            if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
+            if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
+            if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
+            
+            if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
+            if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
+            if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
+            
+        mod_reward_mult = max(0.1, mod_reward_mult)
+        
         coin_mult, xp_mult_event = await get_coin_xp_events()
         if winner == p1_name:
             user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
             rank = await get_user_rank(user['trophies'])
-            coins_won = int(random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult)
-            won_t = await get_dynamic_trophies(rank['name'], diff_trophies_scale)
+            
+            coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
+            coins_won = int(coins_base * mod_reward_mult)
+            
+            won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
+            won_t = int(won_t_base * mod_trophy_mult)
+            
             await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
             
             final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
-            if coin_mult > 1.0: final_text += f" (x{coin_mult})"
+            if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
+            if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
+            
             final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
             
-            bp_xp = int(20 * diff_bp_mult * xp_mult_event)
+            bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
             lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
             final_text += f"🎫 +{bp_xp} BP XP"
-            if xp_mult_event > 1.0: final_text += f" (x{xp_mult_event})"
             if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
             
         elif winner == p2_name:
             await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
             final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
-            bp_xp = int(5 * diff_bp_mult * xp_mult_event)
+            bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
             lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
             final_text += f"🎫 +{bp_xp} BP XP"
-            if xp_mult_event > 1.0: final_text += f" (x{xp_mult_event})"
             if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
             
     await msg.edit_text(final_text)
@@ -2603,6 +2791,15 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     elif diff_type == "hard": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.6, 1.5, 1.2, loc(lang, "Сложный 🔴", "Hard 🔴")
     elif diff_type == "nightmare": power_mult, trophies_scale, bp_xp_mult, diff_name = 2.0, 1.8, 1.5, loc(lang, "Кошмар ☠️", "Nightmare ☠️")
         
+    mods = {
+        'mod_enemy_hp': user.get('mod_enemy_hp', 0),
+        'mod_enemy_atk_all': user.get('mod_enemy_atk_all', 0),
+        'mod_enemy_stats': user.get('mod_enemy_stats', 0),
+        'mod_player_atk_all': user.get('mod_player_atk_all', 0),
+        'mod_manual_atk': user.get('mod_manual_atk', 0),
+        'mod_player_hp': user.get('mod_player_hp', 0)
+    }
+
     await callback.message.edit_text(loc(lang, f"⚔️ <i>Ищем противника... Сложность: <b>{diff_name}</b></i>", f"⚔️ <i>Finding opponent... Diff: <b>{diff_name}</b></i>"))
     
     team1 = await get_team_data(callback.from_user.id)
@@ -2610,12 +2807,29 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     
     team2 = await get_bot_team(callback.from_user.id, rank['difficulty_mult'] * power_mult, rank['name'], diff_type)
     if not team2: return await callback.message.edit_text("Error: no cards in DB")
-        
+    
+    # Применяем модификаторы статов перед боем
+    if mods['mod_enemy_hp']:
+        for c in team2:
+            c['hp'] = int(c['hp'] * 1.5)
+            c['max_hp'] = c['hp']
+    if mods['mod_enemy_stats']:
+        for c in team2:
+            c['damage'] = int(c['damage'] * 1.2)
+            c['hp'] = int(c['hp'] * 1.2)
+            c['max_hp'] = c['hp']
+            c['booster_dmg_mult'] *= 1.2
+            c['booster_hp_mult'] *= 1.2
+    if mods['mod_player_hp']:
+        for c in team1:
+            c['hp'] = int(c['hp'] * 1.3)
+            c['max_hp'] = c['hp']
+            
     title_str = await get_user_titles_str(callback.from_user.id, lang)
     p1_name = get_display_name(user) + title_str
     active_combats.add(callback.from_user.id)
     
-    asyncio.create_task(run_battle_loop(bot, callback.message.chat.id, callback.from_user.id, p1_name, 0, f"AI ({diff_name})", team1, team2, trophies_scale, bp_xp_mult, is_pvp=False, lang=lang))
+    asyncio.create_task(run_battle_loop(bot, callback.message.chat.id, callback.from_user.id, p1_name, 0, f"AI ({diff_name})", team1, team2, trophies_scale, bp_xp_mult, is_pvp=False, lang=lang, mods=mods))
     await callback.answer()
 
 # ========================================================================
@@ -2836,7 +3050,7 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
     if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
     if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
 
-    # Логика выпадения уникального кода-награды (0.25% шанс)
+    # Логика выпадения уникального кода-награды (шанс 1%)
     code_text_1 = ""
     code_text_2 = ""
     winner_user_id = None
@@ -2846,7 +3060,7 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
         elif winner == p2_name: winner_user_id = p2_id
         
     if winner_user_id is not None:
-        if random.random() <= 0.0025:
+        if random.random() <= 0.01:
             db = await get_db_connection()
             try:
                 async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 LIMIT 1") as cursor:
@@ -3548,7 +3762,7 @@ async def adm_codes_main(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="📜 Просмотр кодов", callback_data="adm_code_list_0")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
-    await callback.message.edit_text("🎁 <b>Управление Уникальными Кодами-наградами</b>\nКоды с шансом 0.25% могут выпадать победителям боёв.", reply_markup=kb)
+    await callback.message.edit_text("🎁 <b>Управление Уникальными Кодами-наградами</b>\nКоды с шансом 1% могут выпадать победителям боёв.", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data == "adm_code_gen")
@@ -3685,10 +3899,15 @@ async def generate_and_save_codes(message: types.Message, state: FSMContext, cou
 @dp.callback_query(F.data.startswith("adm_code_list_"))
 async def adm_code_list(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[3])
-    codes = await fetch_all("SELECT * FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY code DESC")
+    # Убрали условие AND owner_id = 0, чтобы админ видел все активные коды, включая выбитые игроками
+    codes = await fetch_all("SELECT * FROM reward_codes WHERE is_active = 1 ORDER BY code DESC")
     if not codes: return await callback.answer("Нет активных невыданных кодов.", show_alert=True)
     
-    items = [{"id": c['code'], "btn_text": f"🔑 {c['code'][:8]}... ({c['reward_type']})"} for c in codes]
+    items = []
+    for c in codes:
+        own_status = f"Выбит ID:{c['owner_id']}" if c['owner_id'] != 0 else "Общий"
+        items.append({"id": c['code'], "btn_text": f"🔑 {c['code'][:8]}... ({c['reward_type']} | {own_status})"})
+        
     kb = get_pagination_keyboard(items, page, "admcode", columns=1, items_per_page=8)
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_codes_main")])
     
@@ -3735,8 +3954,9 @@ async def process_code_reward(message: types.Message, state: FSMContext):
             await message.answer(loc(lang, "❌ Код недействителен или уже использован.", "❌ Code is invalid or already used."))
             return await state.clear()
             
-        if code_data['owner_id'] != user_id:
-            await message.answer(loc(lang, "❌ Этот код выбит не вами!", "❌ This code wasn't dropped by you!"))
+        # FIX: Позволяем активировать, если код выдан админом (0) ИЛИ если выбит этим же игроком
+        if code_data['owner_id'] != 0 and code_data['owner_id'] != user_id:
+            await message.answer(loc(lang, "❌ Этот код предназначен не для вас!", "❌ This code wasn't meant for you!"))
             return await state.clear()
             
         await db.execute("UPDATE reward_codes SET is_active = 0 WHERE code = ?", (code,))
@@ -3759,7 +3979,7 @@ async def process_code_reward(message: types.Message, state: FSMContext):
         await db.commit()
     except Exception as e:
         logging.error(f"Code redeem error: {e}")
-        await message.answer(loc(lang, "❌ Произошла ошибка.", "❌ An error occurred."))
+        await message.answer(loc(lang, "❌ Произошла ошибка при получении награды. Обратитесь к админу.", "❌ An error occurred while redeeming."))
     finally:
         await db.close()
     await state.clear()
@@ -4607,7 +4827,7 @@ async def adm_bp_finish_and_save(callback: types.CallbackQuery, state: FSMContex
         await db.close()
         
     await callback.message.answer("🎉 Батл-пасс успешно сохранен в базу и доступен игрокам!")
-    await log_admin(callback.from_user.id, f"Создал новый Батл-пасс: {data['bp_title']}")
+    await log_admin(callback.fromuser_id, f"Создал новый Батл-пасс: {data['bp_title']}")
     await state.clear()
 
 # ========================================================================
@@ -5455,7 +5675,7 @@ async def main():
     ]
     await bot.set_my_commands(commands)
     
-    logging.info("🤖 Карточный бот успешно перезапущен (Healer + 4 слота + Уведомления стока + Автоподбор PvP + Сид-Паки + Цены + Фиксы + Коды-Награды)!")
+    logging.info("🤖 Карточный бот успешно перезапущен (Healer + 4 слота + Уведомления стока + Моды + Фиксы кодов + Баланс)!")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
