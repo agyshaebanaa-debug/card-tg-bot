@@ -192,6 +192,16 @@ async def check_and_update_schema():
             )
         """)
         
+        # Логи действий юзеров
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_action_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         for col in ['first_name', 'q_cards_opened', 'q_rare_obtained', 'q_wins', 'q_battles', 'q_shop_buys', 'quests_cooldown', 'pity_mythic', 'pity_super', 'equip4', 'q_pvp_played', 'q_heals_done']:
             try: await db.execute(f"ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0")
             except aiosqlite.OperationalError: pass
@@ -419,6 +429,15 @@ async def check_and_update_schema():
         await db.close()
 
 # ========================================================================
+# ЛОГГИРОВАНИЕ ДЕЙСТВИЙ ИГРОКОВ (ДЛЯ АДМИН ПАНЕЛИ)
+# ========================================================================
+async def log_user_action(user_id: int, action: str):
+    try:
+        await execute_db("INSERT INTO user_action_logs (user_id, action) VALUES (?, ?)", (user_id, action))
+    except Exception as e:
+        logging.error(f"Failed to log user action: {e}")
+
+# ========================================================================
 # FSM СОСТОЯНИЯ
 # ========================================================================
 class AddCard(StatesGroup):
@@ -457,6 +476,7 @@ class AdminManage(StatesGroup):
     give_coins_amount = State()
     give_trophies_id = State()
     give_trophies_amount = State()
+    view_logs_id = State()
     
 class AdminLBRewards(StatesGroup):
     bracket = State()
@@ -1029,7 +1049,12 @@ async def cmd_start(message: types.Message):
         (message.from_user.username, message.from_user.first_name, message.from_user.id)
     )
     
-    active_combats.discard(message.from_user.id)
+    # ФИКС: Если игрок жмет /start во время боя, мы заставляем его "Сдаться", 
+    # чтобы корректно прервать запущенный цикл боя.
+    if message.from_user.id in active_combats:
+        surrendered_players.add(message.from_user.id)
+        
+    await log_user_action(message.from_user.id, "Открыл главное меню (/start)")
 
     user = await fetch_one("SELECT lang FROM users WHERE id = ?", (message.from_user.id,))
     lang = user['lang'] if user else "ru"
@@ -1263,7 +1288,7 @@ async def cmd_profile(message: types.Message):
             
             if row:
                 mult = get_mutation_multiplier(row['mutation'])
-                mut_str = " 🌈" if row['mutation'] == "Rainbow" else (" ⭐" if row['mutation'] == "Gold" else "")
+                mut_str = " 🌈" if row['mutation'] == "Rainbow" else (" ⭐" if row['mutation'] == 'Gold' else "")
                 c_dict = dict(row)
                 if row['signed_by'] > 0:
                     signer = await fetch_one("SELECT username, first_name FROM users WHERE id = ?", (row['signed_by'],))
@@ -1466,6 +1491,8 @@ async def callback_buy_shop(callback: types.CallbackQuery):
         mut_str = loc(lang, "🌈 Радужная" if mut == 'Rainbow' else ("⭐ Золотая" if mut == 'Gold' else "Обычная"), "🌈 Rainbow" if mut == 'Rainbow' else ("⭐ Gold" if mut == 'Gold' else "Normal"))
         await callback.message.answer(loc(lang, f"✨ <b>Успешная покупка ГАРАНТА!</b>\nВы выбили: {format_card_name(won_card)}\nМутация: <b>{mut_str}</b>", f"✨ <b>Guaranteed purchase success!</b>\nYou got: {format_card_name(won_card)}\nMutation: <b>{mut_str}</b>"))
 
+    await log_user_action(user_id, f"Купил в магазине: {i_type} ({item['price']}💰)")
+
     items = await fetch_all("SELECT * FROM shop_items WHERE stock > 0")
     if not items:
         await callback.message.edit_text(loc(lang, "🛒 <b>Магазин полностью распродан!</b>\nЖдите следующего завоза.", "🛒 <b>Shop is fully sold out!</b>\nWait for next restock."))
@@ -1512,6 +1539,7 @@ async def cmd_getcard(message: types.Message):
         
     await execute_db("UPDATE users SET last_getcard = ? WHERE id = ?", (now, user['id']))
     await add_quest_progress(user['id'], 'q_cards_opened', 1)
+    await log_user_action(user['id'], f"Выбил карту: {won_card['name']} (ID:{won_card['id']}, Мутация: {won_card['mutation']})")
     
     n_fmt = format_card_name(won_card)
     rarity_text = format_rarity_display(won_card['rarity'])
@@ -1706,7 +1734,7 @@ async def cmd_inventory(message: types.Message):
 @dp.callback_query(F.data.startswith("inv_page_"))
 async def callback_inventory_page(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[2])
-    text, kb = await get_inventory_text_and_kb(callback.from_user.id, page)
+    text, kb = await get_inventory_text_and_kb(callback.fromuser.id, page)
     await callback.message.edit_text(text, reply_markup=kb)
     await callback.answer()
 
@@ -2461,7 +2489,6 @@ async def execute_turn(atk_team, def_team, atk_name, def_name, log1, log2, lang1
     return True, heals
 
 async def get_dynamic_trophies(rank_name: str, rank_idx: int, diff_scale: float = 1.0) -> int:
-    # ИСПРАВЛЕНИЕ: Меньше отнимаем базу, гарантируем минимум 5 кубков на любом ранге (до применения множителя)
     base = max(5, 18 - int((rank_idx / 25) * 12)) 
     won = random.randint(base, base+3)
     return int(won * diff_scale)
@@ -2517,7 +2544,11 @@ async def player_manual_turn(chat_id, p1_id, t1, t2, lang):
             kb_btns.append([InlineKeyboardButton(text=f"{icon} {c['name']} ({icon}{stat_val} | ❤️{c['hp']})", callback_data=f"manatk_{i}")])
             
     kb = InlineKeyboardMarkup(inline_keyboard=kb_btns)
-    msg = await bot.send_message(chat_id, loc(lang, "⏳ <b>Ваш ход!</b> Выберите карту для действия (12 сек):", "⏳ <b>Your turn!</b> Select card (12s):"), reply_markup=kb)
+    
+    try:
+        msg = await bot.send_message(chat_id, loc(lang, "⏳ <b>Ваш ход!</b> Выберите карту для действия (12 сек):", "⏳ <b>Your turn!</b> Select card (12s):"), reply_markup=kb)
+    except:
+        return None, None
 
     try:
         await asyncio.wait_for(ev.wait(), timeout=12.0)
@@ -2563,7 +2594,8 @@ async def cb_man_atk(callback: types.CallbackQuery):
             kb_btns.append([InlineKeyboardButton(text=f"{'💗' if is_heal else '🎯'} {c['name']} (⚔️{dmg_val} | ❤️{c['hp']})", callback_data=f"mantgt_{i}")])
             
     kb = InlineKeyboardMarkup(inline_keyboard=kb_btns)
-    await callback.message.edit_text(f"Выбран: <b>{atk['name']}</b>\nВыберите цель:", reply_markup=kb)
+    try: await callback.message.edit_text(f"Выбран: <b>{atk['name']}</b>\nВыберите цель:", reply_markup=kb)
+    except: pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("mantgt_"))
@@ -2609,201 +2641,234 @@ async def battle_delay(*p_ids, delay=3.0):
             break
 
 async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
-    msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
-    await asyncio.sleep(1)
-    await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
-    await asyncio.sleep(1)
-    await msg.edit_text(loc(lang, "⚔️ Бой начнется через 1 сек!", "⚔️ Battle starts in 1s!"))
-    
-    battle_start_time = time.time()
-    log = []
-    apply_boosters(t1, p1_name, log, None, lang, lang)
-    apply_boosters(t2, p2_name, log, None, lang, lang)
-    
-    if log:
-        await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-        await battle_delay(p1_id, p2_id)
-
-    turn = 1
-    winner = None
-    p1_total_heals = 0
-    p2_total_heals = 0
-    timeout_flag = False
-    
-    while True:
-        if time.time() - battle_start_time > 180:
-            timeout_flag = True
-            break
-            
-        # Проверка кнопки сдаться
-        if p1_id in surrendered_players:
-            winner = p2_name; winner_id = p2_id; loser_id = p1_id
-            surrendered_players.discard(p1_id)
-            log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-            break
-
-        t1_alive = [c for c in t1 if c['hp'] > 0]
-        t2_alive = [c for c in t2 if c['hp'] > 0]
+    try:
+        msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
+        await asyncio.sleep(1)
+        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
+        except: pass
+        await asyncio.sleep(1)
+        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 1 сек!", "⚔️ Battle starts in 1s!"))
+        except: pass
         
-        if not t1_alive and not t2_alive:
-            winner = loc(lang, "Ничья", "Draw"); break
-        elif not t1_alive:
-            winner = p2_name; winner_id = p2_id; loser_id = p1_id; break
-        elif not t2_alive:
-            winner = p1_name; winner_id = p1_id; loser_id = p2_id; break
-            
-        if turn > 30:
-            winner = loc(lang, "Ничья по раундам", "Timeout Draw"); break
-
-        # Ход игрока
-        did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-        p1_total_heals += heals
-        if did_turn:
-            if len(log) > 6: log = log[-6:]
-            await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+        battle_start_time = time.time()
+        log = []
+        apply_boosters(t1, p1_name, log, None, lang, lang)
+        apply_boosters(t2, p2_name, log, None, lang, lang)
+        
+        if log:
+            try:
+                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+            except Exception as e:
+                pass
             await battle_delay(p1_id, p2_id)
 
-        # Модификатор: ИИ атакует каждый ход
-        if mods and mods.get('mod_enemy_atk_all') and not is_pvp and [c for c in t2 if c['hp']>0] and [c for c in t1 if c['hp']>0]:
-            did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-            p2_total_heals += heals_e
-            if did_turn_e:
-                if len(log) > 6: log = log[-6:]
-                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                await battle_delay(p1_id, p2_id)
-
-        t2_alive = [c for c in t2 if c['hp'] > 0]
-        if t2_alive:
+        turn = 1
+        winner = None
+        winner_id = None
+        loser_id = None
+        p1_total_heals = 0
+        p2_total_heals = 0
+        timeout_flag = False
+        
+        while True:
             if time.time() - battle_start_time > 180:
                 timeout_flag = True
                 break
-
-            # Обычный ход ИИ
-            did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-            p2_total_heals += heals_e
-            if did_turn_e:
-                if len(log) > 6: log = log[-6:]
-                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                await battle_delay(p1_id, p2_id)
                 
-            # Модификатор: Игрок атакует каждый ход
-            if mods and mods.get('mod_player_atk_all') and not is_pvp and [c for c in t1 if c['hp']>0] and [c for c in t2 if c['hp']>0]:
-                did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-                p1_total_heals += heals
-                if did_turn:
-                    if len(log) > 6: log = log[-6:]
+            # Проверка кнопки сдаться или /start
+            if p1_id in surrendered_players:
+                winner = p2_name; winner_id = p2_id; loser_id = p1_id
+                surrendered_players.discard(p1_id)
+                log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                break
+
+            t1_alive = [c for c in t1 if c['hp'] > 0]
+            t2_alive = [c for c in t2 if c['hp'] > 0]
+            
+            if not t1_alive and not t2_alive:
+                winner = loc(lang, "Ничья", "Draw"); break
+            elif not t1_alive:
+                winner = p2_name; winner_id = p2_id; loser_id = p1_id; break
+            elif not t2_alive:
+                winner = p1_name; winner_id = p1_id; loser_id = p2_id; break
+                
+            if turn > 30:
+                winner = loc(lang, "Ничья по раундам", "Timeout Draw"); break
+
+            # Ход игрока
+            did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
+            p1_total_heals += heals
+            if did_turn:
+                if len(log) > 6: log = log[-6:]
+                try:
                     await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower():
+                        if "not found" in str(e).lower() or "deleted" in str(e).lower():
+                            timeout_flag = True; break
+                await battle_delay(p1_id, p2_id)
+
+            # Модификатор: ИИ атакует каждый ход
+            if mods and mods.get('mod_enemy_atk_all') and not is_pvp and [c for c in t2 if c['hp']>0] and [c for c in t1 if c['hp']>0]:
+                did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+                p2_total_heals += heals_e
+                if did_turn_e:
+                    if len(log) > 6: log = log[-6:]
+                    try:
+                        await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower():
+                            if "not found" in str(e).lower() or "deleted" in str(e).lower():
+                                timeout_flag = True; break
                     await battle_delay(p1_id, p2_id)
-        turn += 1
 
-    if timeout_flag:
-        active_combats.discard(p1_id)
-        if is_pvp and p2_id != 0: active_combats.discard(p2_id)
-        await msg.edit_text(loc(lang, "⏳ <b>Бой автоматически прерван по тайм-ауту (более 3 минут)!</b> Состояние сброшено.", 
-                                  "⏳ <b>Battle automatically terminated due to timeout (over 3 min)!</b> State cleared."))
-        return
+            t2_alive = [c for c in t2 if c['hp'] > 0]
+            if t2_alive:
+                if time.time() - battle_start_time > 180:
+                    timeout_flag = True
+                    break
 
-    if p1_total_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_total_heals)
-    
-    if is_pvp:
-        await add_quest_progress(p1_id, 'q_pvp_played', 1)
-        if p2_id != 0: 
-            await add_quest_progress(p2_id, 'q_pvp_played', 1)
-            if p2_total_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_total_heals)
-    else:
-        await add_quest_progress(p1_id, 'q_battles', 1)
-        if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
+                # Обычный ход ИИ
+                did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+                p2_total_heals += heals_e
+                if did_turn_e:
+                    if len(log) > 6: log = log[-6:]
+                    try:
+                        await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower():
+                            if "not found" in str(e).lower() or "deleted" in str(e).lower():
+                                timeout_flag = True; break
+                    await battle_delay(p1_id, p2_id)
+                    
+                # Модификатор: Игрок атакует каждый ход
+                if mods and mods.get('mod_player_atk_all') and not is_pvp and [c for c in t1 if c['hp']>0] and [c for c in t2 if c['hp']>0]:
+                    did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
+                    p1_total_heals += heals
+                    if did_turn:
+                        if len(log) > 6: log = log[-6:]
+                        try:
+                            await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                        except Exception as e:
+                            if "message is not modified" not in str(e).lower():
+                                if "not found" in str(e).lower() or "deleted" in str(e).lower():
+                                    timeout_flag = True; break
+                        await battle_delay(p1_id, p2_id)
+            turn += 1
 
-    # Логика выпадения уникального кода-награды (ШАНС 4%)
-    code_text = ""
-    winner_user_id = None
-    if winner == p1_name: winner_user_id = p1_id
-    elif is_pvp and winner == p2_name: winner_user_id = p2_id
-
-    if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-        if random.random() <= 0.04:
-            db = await get_db_connection()
+        if timeout_flag:
             try:
-                # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
-                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        code_val = row['code']
-                        await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                        await db.commit()
-                        code_text = loc(lang,
-                            f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n",
-                            f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                        )
-            except Exception as e:
-                logging.error(f"Reward Code Drop Error: {e}")
-            finally:
-                await db.close()
+                await msg.edit_text(loc(lang, "⏳ <b>Бой автоматически прерван (ошибка или тайм-аут)!</b> Состояние сброшено.", 
+                                          "⏳ <b>Battle automatically terminated (timeout/error)!</b> State cleared."))
+            except: pass
+            return
 
-    final_text = code_text + loc(lang, f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Победитель: {winner}</b>\n\n", f"🏁 <b>BATTLE RESULTS: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Winner: {winner}</b>\n\n")
-    bp_messages = []
-    
-    if pvp_no_rewards:
-        final_text += loc(lang, "🤝 <b>Дружеская дуэль завершена!</b> Награды и кубки не начислялись.", "🤝 <b>Friendly duel finished!</b> No rewards or trophies.")
-    elif is_pvp:
-        if "Draw" not in winner and "Ничья" not in winner:
-            await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
-            await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
-            final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
-    else:
-        # Расчет наград с модификаторами
-        mod_reward_mult = 1.0
-        mod_trophy_mult = 1.0
-        if mods:
-            if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
-            if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
-            if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
-            
-            if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
-            if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
-            if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
-            
-        mod_reward_mult = max(0.1, mod_reward_mult)
+        if p1_total_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_total_heals)
         
-        coin_mult, xp_mult_event = await get_coin_xp_events()
-        if winner == p1_name:
-            user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
-            rank = await get_user_rank(user['trophies'])
+        if is_pvp:
+            await add_quest_progress(p1_id, 'q_pvp_played', 1)
+            if p2_id != 0: 
+                await add_quest_progress(p2_id, 'q_pvp_played', 1)
+                if p2_total_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_total_heals)
+        else:
+            await add_quest_progress(p1_id, 'q_battles', 1)
+            if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
+
+        # Логика выпадения уникального кода-награды (ШАНС 4%)
+        code_text = ""
+        winner_user_id = None
+        if winner == p1_name: winner_user_id = p1_id
+        elif is_pvp and winner == p2_name: winner_user_id = p2_id
+
+        if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
+            if random.random() <= 0.04:
+                db = await get_db_connection()
+                try:
+                    # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
+                    async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            code_val = row['code']
+                            await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
+                            await db.commit()
+                            code_text = loc(lang,
+                                f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n",
+                                f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
+                            )
+                except Exception as e:
+                    logging.error(f"Reward Code Drop Error: {e}")
+                finally:
+                    await db.close()
+
+        final_text = code_text + loc(lang, f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Победитель: {winner}</b>\n\n", f"🏁 <b>BATTLE RESULTS: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Winner: {winner}</b>\n\n")
+        bp_messages = []
+        
+        if pvp_no_rewards:
+            final_text += loc(lang, "🤝 <b>Дружеская дуэль завершена!</b> Награды и кубки не начислялись.", "🤝 <b>Friendly duel finished!</b> No rewards or trophies.")
+        elif is_pvp:
+            if "Draw" not in winner and "Ничья" not in winner and winner_id and loser_id:
+                await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
+                await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
+                final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
+        else:
+            # Расчет наград с модификаторами
+            mod_reward_mult = 1.0
+            mod_trophy_mult = 1.0
+            if mods:
+                if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
+                if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
+                if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
+                
+                if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
+                if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
+                if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
+                
+            mod_reward_mult = max(0.1, mod_reward_mult)
             
-            coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
-            coins_won = int(coins_base * mod_reward_mult)
-            
-            won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
-            won_t = int(won_t_base * mod_trophy_mult)
-            
-            await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
-            
-            final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
-            if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
-            if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
-            
-            final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
-            
-            bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-            lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-            final_text += f"🎫 +{bp_xp} BP XP"
-            if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-            
-        elif winner == p2_name:
-            await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
-            final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
-            bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-            lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-            final_text += f"🎫 +{bp_xp} BP XP"
-            if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-            
-    await msg.edit_text(final_text, reply_markup=None)
-    for b_msg in bp_messages:
-        try: await bot.send_message(p1_id, b_msg)
+            coin_mult, xp_mult_event = await get_coin_xp_events()
+            if winner == p1_name:
+                user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
+                rank = await get_user_rank(user['trophies'])
+                
+                coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
+                coins_won = int(coins_base * mod_reward_mult)
+                
+                won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
+                won_t = int(won_t_base * mod_trophy_mult)
+                
+                await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
+                
+                final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
+                if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
+                if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
+                
+                final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
+                
+                bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
+                lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
+                final_text += f"🎫 +{bp_xp} BP XP"
+                if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
+                
+            elif winner == p2_name:
+                await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
+                final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
+                bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
+                lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
+                final_text += f"🎫 +{bp_xp} BP XP"
+                if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
+                
+        try: await msg.edit_text(final_text, reply_markup=None)
         except: pass
         
-    active_combats.discard(p1_id)
-    if is_pvp and p2_id != 0: active_combats.discard(p2_id)
+        for b_msg in bp_messages:
+            try: await bot.send_message(p1_id, b_msg)
+            except: pass
+            
+    finally:
+        active_combats.discard(p1_id)
+        if is_pvp and p2_id != 0: active_combats.discard(p2_id)
+        if chat_id in active_manual_battles:
+            active_manual_battles.pop(chat_id, None)
 
 @dp.message(F.text.in_(BTN_PVE))
 async def cmd_pve_select(message: types.Message):
@@ -2850,13 +2915,17 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
         'mod_player_hp': user.get('mod_player_hp', 0)
     }
 
-    await callback.message.edit_text(loc(lang, f"⚔️ <i>Ищем противника... Сложность: <b>{diff_name}</b></i>", f"⚔️ <i>Finding opponent... Diff: <b>{diff_name}</b></i>"))
+    try: await callback.message.edit_text(loc(lang, f"⚔️ <i>Ищем противника... Сложность: <b>{diff_name}</b></i>", f"⚔️ <i>Finding opponent... Diff: <b>{diff_name}</b></i>"))
+    except: pass
     
     team1 = await get_team_data(callback.from_user.id)
     rank = await get_user_rank(user['trophies'])
     
     team2 = await get_bot_team(callback.from_user.id, rank['difficulty_mult'] * power_mult, rank['name'], diff_type)
-    if not team2: return await callback.message.edit_text("Error: no cards in DB")
+    if not team2: 
+        try: await callback.message.edit_text("Error: no cards in DB")
+        except: pass
+        return
     
     # Применяем модификаторы статов перед боем
     if mods['mod_enemy_hp']:
@@ -2878,6 +2947,8 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     title_str = await get_user_titles_str(callback.from_user.id, lang)
     p1_name = get_display_name(user) + title_str
     active_combats.add(callback.from_user.id)
+    
+    await log_user_action(callback.from_user.id, f"Начал PvE бой (сложность: {diff_type})")
     
     asyncio.create_task(run_battle_loop(bot, callback.message.chat.id, callback.from_user.id, p1_name, 0, f"AI ({diff_name})", team1, team2, trophies_scale, bp_xp_mult, is_pvp=False, lang=lang, mods=mods))
     await callback.answer()
@@ -2903,7 +2974,8 @@ async def cmd_pvp_menu(message: types.Message):
 async def cb_pvp_direct(callback: types.CallbackQuery, state: FSMContext):
     user = await fetch_one("SELECT lang FROM users WHERE id=?", (callback.from_user.id,))
     lang = user['lang'] if user else 'ru'
-    await callback.message.edit_text(loc(lang, "Введите @username или ID игрока:", "Enter @username or ID of player:"))
+    try: await callback.message.edit_text(loc(lang, "Введите @username или ID игрока:", "Enter @username or ID of player:"))
+    except: pass
     await state.set_state(PvPState.waiting_target)
     asyncio.create_task(clear_fsm_timeout(state, callback.message.chat.id, 60))
     await callback.answer()
@@ -2920,7 +2992,9 @@ async def cb_pvp_random(callback: types.CallbackQuery):
     
     if u_id in pvp_queue:
         pvp_queue.remove(u_id)
-        return await callback.message.edit_text(loc(lang, "Поиск отменен.", "Search cancelled."))
+        try: await callback.message.edit_text(loc(lang, "Поиск отменен.", "Search cancelled."))
+        except: pass
+        return
         
     valid_opponents = [x for x in pvp_queue if x != u_id and x not in active_combats and x not in user_trades]
     
@@ -2939,15 +3013,20 @@ async def cb_pvp_random(callback: types.CallbackQuery):
         p1_name = get_display_name(user) + title_p1
         p2_name = get_display_name(opp) + title_p2
         
-        await callback.message.edit_text(loc(lang, "Противник найден! Начинаем...", "Opponent found! Starting..."))
+        try: await callback.message.edit_text(loc(lang, "Противник найден! Начинаем...", "Opponent found! Starting..."))
+        except: pass
         try: await bot.send_message(opp_id, loc(opp['lang'], "Противник найден! Начинаем...", "Opponent found! Starting..."))
         except: pass
+        
+        await log_user_action(u_id, f"Начал PvP бой (Автоподбор) против {opp_id}")
+        await log_user_action(opp_id, f"Начал PvP бой (Автоподбор) против {u_id}")
         
         asyncio.create_task(run_pvp_dual_broadcast(u_id, opp_id, p1_name, p2_name, t1, t2))
     else:
         pvp_queue.add(u_id)
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=loc(lang, "❌ Отменить поиск", "❌ Cancel Search"), callback_data="pvp_random")]])
-        await callback.message.edit_text(loc(lang, "🔍 Поиск противника... Ожидайте.", "🔍 Searching opponent... Wait."), reply_markup=kb)
+        try: await callback.message.edit_text(loc(lang, "🔍 Поиск противника... Ожидайте.", "🔍 Searching opponent... Wait."), reply_markup=kb)
+        except: pass
     await callback.answer()
 
 @dp.message(PvPState.waiting_target)
@@ -2974,6 +3053,7 @@ async def process_pvp_target(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(target_user['id'], loc(t_lang, f"⚔️ <b>{challenger_name}</b> вызывает вас на дуэль!", f"⚔️ <b>{challenger_name}</b> challenges you to a duel!"), reply_markup=kb)
         await message.answer(loc(lang, "📨 Вызов отправлен.", "📨 Challenge sent."))
+        await log_user_action(message.from_user.id, f"Бросил вызов на PvP игроку {target_user['id']}")
     except: await message.answer("Error sending message.")
     await state.clear()
 
@@ -2988,7 +3068,10 @@ async def callback_pvp_accept(callback: types.CallbackQuery):
     t1 = await get_team_data(challenger_id)
     t2 = await get_team_data(target_id)
     
-    if not t1 or not t2: return await callback.message.edit_text("Deck empty error.")
+    if not t1 or not t2: 
+        try: await callback.message.edit_text("Deck empty error.")
+        except: pass
+        return
         
     challenger = await fetch_one("SELECT * FROM users WHERE id = ?", (challenger_id,))
     target = await fetch_one("SELECT * FROM users WHERE id = ?", (target_id,))
@@ -3001,8 +3084,11 @@ async def callback_pvp_accept(callback: types.CallbackQuery):
     active_combats.add(challenger_id)
     active_combats.add(target_id)
     
+    await log_user_action(target_id, f"Принял PvP вызов от {challenger_id}")
+    
     asyncio.create_task(run_pvp_dual_broadcast(challenger_id, target_id, p1_name, p2_name, t1, t2))
-    await callback.message.delete()
+    try: await callback.message.delete()
+    except: pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("pvp_decline_"))
@@ -3011,155 +3097,166 @@ async def callback_pvp_decline(callback: types.CallbackQuery):
     target = await fetch_one("SELECT * FROM users WHERE id = ?", (callback.from_user.id,))
     try: await bot.send_message(challenger_id, f"❌ Declined.")
     except: pass
-    await callback.message.edit_text("❌ Declined.")
+    try: await callback.message.edit_text("❌ Declined.")
+    except: pass
     await callback.answer()
 
 async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: str, t1: list, t2: list):
-    p1_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p1_id,)))['lang']
-    p2_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p2_id,)))['lang']
-    
-    msg1 = await bot.send_message(p1_id, loc(p1_lang, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p2_name}</b> in 3s!"))
-    msg2 = await bot.send_message(p2_id, loc(p2_lang, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p1_name}</b> in 3s!"))
-    await asyncio.sleep(1)
-    await msg1.edit_text("2...")
-    await msg2.edit_text("2...")
-    await asyncio.sleep(1)
-    await msg1.edit_text("1...")
-    await msg2.edit_text("1...")
-    await asyncio.sleep(1)
-    
-    battle_start_time = time.time()
-    log1 = []
-    log2 = []
-    apply_boosters(t1, p1_name, log1, log2, p1_lang, p2_lang)
-    apply_boosters(t2, p2_name, log1, log2, p1_lang, p2_lang)
-    
-    if log1:
-        header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
-        header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
-        await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
-        await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
-        await battle_delay(p1_id, p2_id)
-
-    turn = 1
-    winner = None
-    p1_heals = p2_heals = 0
-    timeout_flag = False
-    
-    while True:
-        if time.time() - battle_start_time > 180:
-            timeout_flag = True
-            break
-            
-        # Проверка сдающихся
-        if p1_id in surrendered_players and p2_id in surrendered_players:
-            winner = "Draw"
-            surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
-            break
-        elif p1_id in surrendered_players:
-            winner = p2_name
-            surrendered_players.discard(p1_id)
-            log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-            log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-            break
-        elif p2_id in surrendered_players:
-            winner = p1_name
-            surrendered_players.discard(p2_id)
-            log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-            log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-            break
-
-        t1_a = [c for c in t1 if c['hp'] > 0]
-        t2_a = [c for c in t2 if c['hp'] > 0]
-        if not t1_a and not t2_a: winner = "Draw"; break
-        elif not t1_a: winner = p2_name; break
-        elif not t2_a: winner = p1_name; break
-        if turn > 30: winner = "Timeout Draw"; break
-
-        did_turn, h = await execute_turn(t1, t2, p1_name, p2_name, log1, log2, p1_lang, p2_lang)
-        p1_heals += h
-        if did_turn:
-            if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-            try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
+    try:
+        p1_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p1_id,)))['lang']
+        p2_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p2_id,)))['lang']
+        
+        msg1 = await bot.send_message(p1_id, loc(p1_lang, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p2_name}</b> in 3s!"))
+        msg2 = await bot.send_message(p2_id, loc(p2_lang, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p1_name}</b> in 3s!"))
+        await asyncio.sleep(1)
+        try: await msg1.edit_text("2...")
+        except: pass
+        try: await msg2.edit_text("2...")
+        except: pass
+        await asyncio.sleep(1)
+        try: await msg1.edit_text("1...")
+        except: pass
+        try: await msg2.edit_text("1...")
+        except: pass
+        await asyncio.sleep(1)
+        
+        battle_start_time = time.time()
+        log1 = []
+        log2 = []
+        apply_boosters(t1, p1_name, log1, log2, p1_lang, p2_lang)
+        apply_boosters(t2, p2_name, log1, log2, p1_lang, p2_lang)
+        
+        if log1:
+            header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
+            header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
+            try: await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
             except: pass
-            try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
+            try: await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
             except: pass
             await battle_delay(p1_id, p2_id)
 
-        t2_a = [c for c in t2 if c['hp'] > 0]
-        if t2_a:
+        turn = 1
+        winner = None
+        p1_heals = p2_heals = 0
+        timeout_flag = False
+        
+        while True:
             if time.time() - battle_start_time > 180:
                 timeout_flag = True
                 break
                 
-            did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
-            p2_heals += h
+            # Проверка сдающихся
+            if p1_id in surrendered_players and p2_id in surrendered_players:
+                winner = "Draw"
+                surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
+                break
+            elif p1_id in surrendered_players:
+                winner = p2_name
+                surrendered_players.discard(p1_id)
+                log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                break
+            elif p2_id in surrendered_players:
+                winner = p1_name
+                surrendered_players.discard(p2_id)
+                log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
+                log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
+                break
+
+            t1_a = [c for c in t1 if c['hp'] > 0]
+            t2_a = [c for c in t2 if c['hp'] > 0]
+            if not t1_a and not t2_a: winner = "Draw"; break
+            elif not t1_a: winner = p2_name; break
+            elif not t2_a: winner = p1_name; break
+            if turn > 30: winner = "Timeout Draw"; break
+
+            did_turn, h = await execute_turn(t1, t2, p1_name, p2_name, log1, log2, p1_lang, p2_lang)
+            p1_heals += h
             if did_turn:
                 if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
                 try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
-                except: pass
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
                 try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
-                except: pass
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
                 await battle_delay(p1_id, p2_id)
-        turn += 1
 
-    if timeout_flag:
+            t2_a = [c for c in t2 if c['hp'] > 0]
+            if t2_a:
+                if time.time() - battle_start_time > 180:
+                    timeout_flag = True
+                    break
+                    
+                did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
+                p2_heals += h
+                if did_turn:
+                    if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
+                    try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                    try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                    await battle_delay(p1_id, p2_id)
+            turn += 1
+
+        if timeout_flag:
+            txt1 = loc(p1_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
+            txt2 = loc(p2_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
+            try: await msg1.edit_text(txt1)
+            except: pass
+            try: await msg2.edit_text(txt2)
+            except: pass
+            return
+
+        await add_quest_progress(p1_id, 'q_pvp_played', 1)
+        await add_quest_progress(p2_id, 'q_pvp_played', 1)
+        if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
+        if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
+
+        # Логика выпадения уникального кода-награды (шанс 4%)
+        code_text_1 = ""
+        code_text_2 = ""
+        winner_user_id = None
+        
+        if "Draw" not in winner and "Ничья" not in winner:
+            if winner == p1_name: winner_user_id = p1_id
+            elif winner == p2_name: winner_user_id = p2_id
+            
+        if winner_user_id is not None:
+            if random.random() <= 0.04:
+                db = await get_db_connection()
+                try:
+                    # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
+                    async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            code_val = row['code']
+                            await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
+                            await db.commit()
+                            dropped_msg_ru = f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n"
+                            dropped_msg_en = f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
+                            if winner_user_id == p1_id:
+                                code_text_1 = loc(p1_lang, dropped_msg_ru, dropped_msg_en)
+                            else:
+                                code_text_2 = loc(p2_lang, dropped_msg_ru, dropped_msg_en)
+                except Exception as e:
+                    logging.error(f"Reward Code Drop PvP Error: {e}")
+                finally:
+                    await db.close()
+
+        final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
+        final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
+        
+        try: await msg1.edit_text(final1, reply_markup=None)
+        except: pass
+        try: await msg2.edit_text(final2, reply_markup=None)
+        except: pass
+        
+    finally:
         active_combats.discard(p1_id)
         active_combats.discard(p2_id)
-        txt1 = loc(p1_lang, "⏳ <b>Бой прерван по тайм-ауту (более 3 мин).</b>", "⏳ <b>Battle timed out (over 3 min).</b>")
-        txt2 = loc(p2_lang, "⏳ <b>Бой прерван по тайм-ауту (более 3 мин).</b>", "⏳ <b>Battle timed out (over 3 min).</b>")
-        try: await msg1.edit_text(txt1)
-        except: pass
-        try: await msg2.edit_text(txt2)
-        except: pass
-        return
-
-    await add_quest_progress(p1_id, 'q_pvp_played', 1)
-    await add_quest_progress(p2_id, 'q_pvp_played', 1)
-    if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
-    if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
-
-    # Логика выпадения уникального кода-награды (шанс 4%)
-    code_text_1 = ""
-    code_text_2 = ""
-    winner_user_id = None
-    
-    if "Draw" not in winner and "Ничья" not in winner:
-        if winner == p1_name: winner_user_id = p1_id
-        elif winner == p2_name: winner_user_id = p2_id
-        
-    if winner_user_id is not None:
-        if random.random() <= 0.04:
-            db = await get_db_connection()
-            try:
-                # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
-                async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                    row = await cursor.fetchone()
-                    if row:
-                        code_val = row['code']
-                        await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                        await db.commit()
-                        dropped_msg_ru = f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n"
-                        dropped_msg_en = f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                        if winner_user_id == p1_id:
-                            code_text_1 = loc(p1_lang, dropped_msg_ru, dropped_msg_en)
-                        else:
-                            code_text_2 = loc(p2_lang, dropped_msg_ru, dropped_msg_en)
-            except Exception as e:
-                logging.error(f"Reward Code Drop PvP Error: {e}")
-            finally:
-                await db.close()
-
-    final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-    final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-    
-    try: await msg1.edit_text(final1, reply_markup=None)
-    except: pass
-    try: await msg2.edit_text(final2, reply_markup=None)
-    except: pass
-    
-    active_combats.discard(p1_id)
-    active_combats.discard(p2_id)
 
 # ========================================================================
 # ТРЕЙДЫ
@@ -3204,6 +3301,7 @@ async def process_trade_target(message: types.Message, state: FSMContext):
     try:
         await bot.send_message(target_user['id'], loc(t_lang, f"🤝 <b>{challenger_name}</b> предлагает обмен!", f"🤝 <b>{challenger_name}</b> offers a trade!"), reply_markup=kb)
         await message.answer(loc(lang, "📨 Запрос отправлен.", "📨 Request sent."))
+        await log_user_action(message.from_user.id, f"Отправил запрос на трейд игроку {target_user['id']}")
     except: await message.answer("Error.")
     await state.clear()
 
@@ -3233,6 +3331,8 @@ async def callback_trade_accept(callback: types.CallbackQuery):
     user_trades[p1_id] = trade_id
     user_trades[p2_id] = trade_id
     
+    await log_user_action(p2_id, f"Принял запрос на трейд от {p1_id}")
+    
     try:
         msg1 = await bot.send_message(p1_id, await render_trade_text(trade, trade['l1']), reply_markup=get_trade_main_kb(trade, p1_id))
         trade['p1_msg'] = msg1.message_id
@@ -3242,7 +3342,8 @@ async def callback_trade_accept(callback: types.CallbackQuery):
         trade['p2_msg'] = msg2.message_id
     except: pass
     
-    await callback.message.delete()
+    try: await callback.message.delete()
+    except: pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("tr_dec_"))
@@ -3250,7 +3351,8 @@ async def callback_trade_decline(callback: types.CallbackQuery):
     p1_id = int(callback.data.split("_")[2])
     try: await bot.send_message(p1_id, "❌ Declined.")
     except: pass
-    await callback.message.edit_text("❌ Declined.")
+    try: await callback.message.edit_text("❌ Declined.")
+    except: pass
     await callback.answer()
 
 async def render_trade_text(trade, lang="ru"):
@@ -3383,7 +3485,8 @@ async def cb_trade_menu_add(callback: types.CallbackQuery):
             
     kb = get_pagination_keyboard(items, 0, "tr_add", columns=1, items_per_page=6)
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
-    await callback.message.edit_text("👇", reply_markup=kb)
+    try: await callback.message.edit_text("👇", reply_markup=kb)
+    except: pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("tr_add_page_"))
@@ -3462,7 +3565,8 @@ async def cb_trade_menu_rem(callback: types.CallbackQuery):
             
     kb = get_pagination_keyboard(items, 0, "tr_rem", columns=1, items_per_page=6)
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
-    await callback.message.edit_text("👇", reply_markup=kb)
+    try: await callback.message.edit_text("👇", reply_markup=kb)
+    except: pass
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("tr_rem_page_"))
@@ -3969,7 +4073,6 @@ async def generate_and_save_codes(message: types.Message, state: FSMContext, cou
 @dp.callback_query(F.data.startswith("adm_code_list_"))
 async def adm_code_list(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[3])
-    # Убрали условие AND owner_id = 0, чтобы админ видел все активные коды, включая выбитые игроками
     codes = await fetch_all("SELECT * FROM reward_codes WHERE is_active = 1 ORDER BY code DESC")
     if not codes: return await callback.answer("Нет активных невыданных кодов.", show_alert=True)
     
@@ -4024,7 +4127,6 @@ async def process_code_reward(message: types.Message, state: FSMContext):
             await message.answer(loc(lang, "❌ Код недействителен или уже использован.", "❌ Code is invalid or already used."))
             return await state.clear()
             
-        # FIX: Позволяем активировать, если код выдан админом (0) ИЛИ если выбит этим же игроком
         if code_data['owner_id'] != 0 and code_data['owner_id'] != user_id:
             await message.answer(loc(lang, "❌ Этот код предназначен не для вас!", "❌ This code wasn't meant for you!"))
             return await state.clear()
@@ -4364,6 +4466,9 @@ async def adm_card_del_finish(message: types.Message, state: FSMContext):
     except: await message.answer("❌ Число.")
     await state.clear()
 
+# ==================================================
+# УПРАВЛЕНИЕ ИГРОКАМИ + ЛОГИ
+# ==================================================
 @dp.callback_query(F.data == "adm_users")
 async def cq_adm_users(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -4373,9 +4478,90 @@ async def cq_adm_users(callback: types.CallbackQuery):
          InlineKeyboardButton(text="🏆 Выдать кубки", callback_data="adm_usr_give_trophies")],
         [InlineKeyboardButton(text="🔄 Сбросить состояние", callback_data="adm_usr_reset_battle")],
         [InlineKeyboardButton(text="🔨 Бан / Разбан", callback_data="adm_usr_ban")],
+        [InlineKeyboardButton(text="📜 Логи игроков (NEW)", callback_data="adm_usr_logs_menu")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
     await callback.message.edit_text("👤 <b>Управление Игроками</b>", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_usr_logs_menu")
+async def adm_usr_logs_menu_start(callback: types.CallbackQuery, state: FSMContext):
+    recent_users = await fetch_all("""
+        SELECT DISTINCT u.id, u.username, u.first_name 
+        FROM user_action_logs l 
+        JOIN users u ON l.user_id = u.id 
+        ORDER BY l.timestamp DESC LIMIT 30
+    """)
+    
+    items = []
+    for u in recent_users:
+        name = get_display_name(u)
+        items.append({"id": u['id'], "btn_text": f"👤 {name} (ID:{u['id']})"})
+        
+    kb = get_pagination_keyboard(items, 0, "admlog_u", columns=1, items_per_page=10)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔍 Поиск по ID", callback_data="admlog_search_id")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_users")])
+    
+    await state.update_data(admlog_users=items)
+    await callback.message.edit_text("📜 <b>Глобальные логи игроков</b>\nВыберите игрока из недавних активных или найдите по ID:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admlog_u_page_"))
+async def admlog_u_paginate(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('admlog_users', []), page, "admlog_u", columns=1, items_per_page=10)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔍 Поиск по ID", callback_data="admlog_search_id")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="adm_users")])
+    try: await callback.message.edit_reply_markup(reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("admlog_u_"))
+async def admlog_u_select(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    uid = int(callback.data.split("_")[2])
+    await show_user_logs(callback, uid)
+
+@dp.callback_query(F.data == "admlog_search_id")
+async def admlog_search_id(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите ID игрока для просмотра его логов:")
+    await state.set_state(AdminManage.view_logs_id)
+    await callback.answer()
+
+@dp.message(AdminManage.view_logs_id)
+async def admlog_search_id_msg(message: types.Message, state: FSMContext):
+    try:
+        uid = int(message.text.strip())
+        await show_user_logs_msg(message, uid)
+    except ValueError:
+        await message.answer("❌ ID должен быть числом.")
+    await state.clear()
+
+async def show_user_logs(callback: types.CallbackQuery, uid: int):
+    logs = await fetch_all("SELECT action, timestamp FROM user_action_logs WHERE user_id = ? ORDER BY id DESC LIMIT 50", (uid,))
+    if not logs:
+        return await callback.answer("У этого игрока нет логов.", show_alert=True)
+        
+    text = f"📜 <b>Последние 50 действий (ID: {uid}):</b>\n\n"
+    for l in logs:
+        text += f"🕒 {l['timestamp']}\n📝 {l['action']}\n\n"
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_usr_logs_menu")]])
+    try: await callback.message.edit_text(text[:4000], reply_markup=kb)
+    except: pass
+    await callback.answer()
+    
+async def show_user_logs_msg(message: types.Message, uid: int):
+    logs = await fetch_all("SELECT action, timestamp FROM user_action_logs WHERE user_id = ? ORDER BY id DESC LIMIT 50", (uid,))
+    if not logs:
+        return await message.answer("У этого игрока нет логов.")
+        
+    text = f"📜 <b>Последние 50 действий (ID: {uid}):</b>\n\n"
+    for l in logs:
+        text += f"🕒 {l['timestamp']}\n📝 {l['action']}\n\n"
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="adm_usr_logs_menu")]])
+    await message.answer(text[:4000], reply_markup=kb)
 
 @dp.callback_query(F.data == "adm_usr_give_coins")
 async def adm_usr_give_coins_start(callback: types.CallbackQuery, state: FSMContext):
@@ -4565,9 +4751,6 @@ async def adm_give_serial_save(message: types.Message, state: FSMContext):
     except ValueError:
         await message.answer("❌ Введите число от 0 до 9999.")
 
-# ========================================================================
-# ЗАБРАТЬ КАРТУ У ИГРОКА (УДАЛИТЬ ИЗ ИНВЕНТАРЯ)
-# ========================================================================
 @dp.callback_query(F.data == "adm_usr_takecard")
 async def adm_usr_take_start(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.answer("Введите ID игрока, у которого хотим забрать карту (удалить):")
@@ -5715,42 +5898,293 @@ async def cq_sp_edit_delete_pack(callback: types.CallbackQuery, pack_id: int):
     await callback.answer(f"✅ Сид-Пак «{name}» полностью удален!", show_alert=True)
     await cb_adm_sp_manage_list(callback, None)
 
-async def main():
-    await check_and_update_schema()
-    
-    shop_exists = await fetch_all("SELECT * FROM shop_items")
-    if not shop_exists: await restock_shop()
-    
-    settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
-    if settings and settings['last_lb_reward'] == 0:
-        await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (time.time(),))
-    
-    asyncio.create_task(shop_auto_restock_task())
-    asyncio.create_task(leaderboard_rewards_task())
-    asyncio.create_task(trade_timeout_task())
-    asyncio.create_task(auto_backup_db())
-    
-    commands = [
-        BotCommand(command="start", description="Главное меню / Main Menu"),
-        BotCommand(command="getcard", description="Выбить карту / Draw Card"),
-        BotCommand(command="shop", description="Магазин / Shop"),
-        BotCommand(command="inventory", description="Инвентарь / Inventory"),
-        BotCommand(command="equip", description="Экипировка колоды / Equip Deck"),
-        BotCommand(command="profile", description="Профиль и статы / Profile & Stats"),
-        BotCommand(command="trade", description="Обменяться картами / Trade Cards"),
-        BotCommand(command="quests", description="Квесты / Quests"),
-        BotCommand(command="index", description="Индекс всех карт / Card Index"),
-        BotCommand(command="top", description="Рейтинг игроков / Leaderboard"),
-        BotCommand(command="codereward", description="Активировать код / Redeem Code")
-    ]
-    await bot.set_my_commands(commands)
-    
-    logging.info("🤖 Карточный бот успешно перезапущен (Healer + 4 слота + Уведомления стока + Моды + Фиксы кодов + Баланс)!")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
 
-if __name__ == "__main__":
+# ========================================================================
+# ПЕРЕОПРЕДЕЛЕНИЕ ФУНКЦИЙ БОЯ ДЛЯ ИСПРАВЛЕНИЯ БАГОВ (ЗАВИСАНИЯ / КНОПКИ)
+# ========================================================================
+
+@dp.callback_query(F.data == "surrender_battle")
+async def cb_surrender_battle(callback: types.CallbackQuery):
+    if callback.from_user.id in active_combats:
+        surrendered_players.add(callback.from_user.id)
+        # Если игрок находится в ожидании ручного выбора цели – принудительно обрываем
+        chat_id = callback.message.chat.id
+        if chat_id in active_manual_battles and active_manual_battles[chat_id]['p1_id'] == callback.from_user.id:
+            active_manual_battles[chat_id]['event'].set()
+        await callback.answer("🏳️ Вы сдались!", show_alert=True)
+    else:
+        await callback.answer("Вы не в бою!", show_alert=True)
+
+async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Бот остановлен.")
+        msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
+        await asyncio.sleep(1)
+        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
+        except: pass
+        await asyncio.sleep(1)
+        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 1 сек!", "⚔️ Battle starts in 1s!"))
+        except: pass
+        
+        battle_start_time = time.time()
+        log = []
+        apply_boosters(t1, p1_name, log, None, lang, lang)
+        apply_boosters(t2, p2_name, log, None, lang, lang)
+        
+        if log:
+            try:
+                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+            except Exception: pass
+            await battle_delay(p1_id, p2_id)
+
+        turn = 1
+        winner = None
+        winner_id = None
+        loser_id = None
+        p1_total_heals = 0
+        p2_total_heals = 0
+        timeout_flag = False
+        
+        while True:
+            if time.time() - battle_start_time > 180:
+                timeout_flag = True
+                break
+                
+            # Проверка сдающихся
+            if p1_id in surrendered_players:
+                winner = p2_name; winner_id = p2_id; loser_id = p1_id
+                surrendered_players.discard(p1_id)
+                log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                break
+
+            # Предварительная проверка жизней ПЕРЕД ходом (предотвращает пустые ходы)
+            t1_alive = [c for c in t1 if c['hp'] > 0]
+            t2_alive = [c for c in t2 if c['hp'] > 0]
+            
+            if not t1_alive and not t2_alive:
+                winner = loc(lang, "Ничья", "Draw"); break
+            elif not t1_alive:
+                winner = p2_name; winner_id = p2_id; loser_id = p1_id; break
+            elif not t2_alive:
+                winner = p1_name; winner_id = p1_id; loser_id = p2_id; break
+                
+            if turn > 40:
+                winner = loc(lang, "Ничья по раундам", "Timeout Draw"); break
+
+            # Ход игрока
+            did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
+            p1_total_heals += heals
+            if did_turn:
+                if len(log) > 6: log = log[-6:]
+                try:
+                    await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                except Exception as e:
+                    if "not found" in str(e).lower() or "deleted" in str(e).lower():
+                        timeout_flag = True; break
+                await battle_delay(p1_id, p2_id)
+
+            # Модификатор: ИИ атакует каждый ход
+            if mods and mods.get('mod_enemy_atk_all') and not is_pvp:
+                t1_a = [c for c in t1 if c['hp']>0]
+                t2_a = [c for c in t2 if c['hp']>0]
+                if t1_a and t2_a:
+                    did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+                    p2_total_heals += heals_e
+                    if did_turn_e:
+                        if len(log) > 6: log = log[-6:]
+                        try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                        except Exception as e:
+                            if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
+                        await battle_delay(p1_id, p2_id)
+
+            t2_alive = [c for c in t2 if c['hp'] > 0]
+            if t2_alive:
+                if time.time() - battle_start_time > 180:
+                    timeout_flag = True
+                    break
+
+                # Обычный ход ИИ
+                did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
+                p2_total_heals += heals_e
+                if did_turn_e:
+                    if len(log) > 6: log = log[-6:]
+                    try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                    except Exception as e:
+                        if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
+                    await battle_delay(p1_id, p2_id)
+                    
+                # Модификатор: Игрок атакует каждый ход
+                if mods and mods.get('mod_player_atk_all') and not is_pvp:
+                    t1_a = [c for c in t1 if c['hp']>0]
+                    t2_a = [c for c in t2 if c['hp']>0]
+                    if t1_a and t2_a:
+                        did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
+                        p1_total_heals += heals
+                        if did_turn:
+                            if len(log) > 6: log = log[-6:]
+                            try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
+                            except Exception as e:
+                                if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
+                            await battle_delay(p1_id, p2_id)
+            turn += 1
+
+        if timeout_flag:
+            try: await msg.edit_text(loc(lang, "⏳ <b>Бой автоматически прерван (ошибка или тайм-аут)!</b>", "⏳ <b>Battle automatically terminated (timeout/error)!</b>"))
+            except: pass
+            return
+
+        # Гарантированное начисление наград и отправка финального сообщения (с защитой от ошибок)
+        try:
+            if p1_total_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_total_heals)
+            
+            if is_pvp:
+                await add_quest_progress(p1_id, 'q_pvp_played', 1)
+                if p2_id != 0: 
+                    await add_quest_progress(p2_id, 'q_pvp_played', 1)
+                    if p2_total_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_total_heals)
+            else:
+                await add_quest_progress(p1_id, 'q_battles', 1)
+                if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
+
+            code_text = ""
+            winner_user_id = None
+            if winner == p1_name: winner_user_id = p1_id
+            elif is_pvp and winner == p2_name: winner_user_id = p2_id
+
+            if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
+                if random.random() <= 0.04:
+                    db = await get_db_connection()
+                    try:
+                        async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
+                            row = await cursor.fetchone()
+                            if row:
+                                code_val = row['code']
+                                await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
+                                await db.commit()
+                                code_text = loc(lang,
+                                    f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n",
+                                    f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
+                                )
+                    except: pass
+                    finally: await db.close()
+
+            final_text = code_text + loc(lang, f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Победитель: {winner}</b>\n\n", f"🏁 <b>BATTLE RESULTS: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Winner: {winner}</b>\n\n")
+            bp_messages = []
+            
+            if pvp_no_rewards:
+                final_text += loc(lang, "🤝 <b>Дружеская дуэль завершена!</b> Награды и кубки не начислялись.", "🤝 <b>Friendly duel finished!</b> No rewards or trophies.")
+            elif is_pvp:
+                if "Draw" not in winner and "Ничья" not in winner and winner_id and loser_id:
+                    await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
+                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
+                    final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
+            else:
+                mod_reward_mult = 1.0; mod_trophy_mult = 1.0
+                if mods:
+                    if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
+                    if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
+                    if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
+                    if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
+                    if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
+                    if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
+                    
+                mod_reward_mult = max(0.1, mod_reward_mult)
+                coin_mult, xp_mult_event = await get_coin_xp_events()
+                
+                if winner == p1_name:
+                    user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
+                    rank = await get_user_rank(user['trophies'])
+                    
+                    coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
+                    coins_won = int(coins_base * mod_reward_mult)
+                    won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
+                    won_t = int(won_t_base * mod_trophy_mult)
+                    
+                    await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
+                    
+                    final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
+                    if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
+                    if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
+                    final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
+                    
+                    bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
+                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
+                    final_text += f"🎫 +{bp_xp} BP XP"
+                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
+                    
+                elif winner == p2_name:
+                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
+                    final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
+                    bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
+                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
+                    final_text += f"🎫 +{bp_xp} BP XP"
+                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
+                    
+            try: await msg.edit_text(final_text, reply_markup=None)
+            except Exception: pass
+            
+            for b_msg in bp_messages:
+                try: await bot.send_message(p1_id, b_msg)
+                except: pass
+
+        except Exception as e:
+            logging.error(f"Reward error: {e}")
+            try: await msg.edit_text("Ошибка при выдаче наград.", reply_markup=None)
+            except: pass
+
+    finally:
+        active_combats.discard(p1_id)
+        if is_pvp and p2_id != 0: active_combats.discard(p2_id)
+        if chat_id in active_manual_battles: active_manual_battles.pop(chat_id, None)
+
+async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: str, t1: list, t2: list):
+    try:
+        p1_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p1_id,)))['lang']
+        p2_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p2_id,)))['lang']
+        
+        msg1 = await bot.send_message(p1_id, loc(p1_lang, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p2_name}</b> in 3s!"))
+        msg2 = await bot.send_message(p2_id, loc(p2_lang, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p1_name}</b> in 3s!"))
+        await asyncio.sleep(1)
+        try: await msg1.edit_text("2...")
+        except: pass
+        try: await msg2.edit_text("2...")
+        except: pass
+        await asyncio.sleep(1)
+        try: await msg1.edit_text("1...")
+        except: pass
+        try: await msg2.edit_text("1...")
+        except: pass
+        await asyncio.sleep(1)
+        
+        battle_start_time = time.time()
+        log1 = []
+        log2 = []
+        apply_boosters(t1, p1_name, log1, log2, p1_lang, p2_lang)
+        apply_boosters(t2, p2_name, log1, log2, p1_lang, p2_lang)
+        
+        if log1:
+            header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
+            header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
+            try: await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
+            except: pass
+            try: await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
+            except: pass
+            await battle_delay(p1_id, p2_id)
+
+        turn = 1
+        winner = None
+        p1_heals = p2_heals = 0
+        timeout_flag = False
+        
+        while True:
+            if time.time() - battle_start_time > 180:
+                timeout_flag = True
+                break
+                
+            if p1_id in surrendered_players and p2_id in surrendered_players:
+                winner = "Draw"
+                surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
+                break
+            elif p1_id in surrendered_players:
+                winner = p2_name; surrendered_players.discard(p1_id)
+                log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                log2.append(loc(p2_lang, f"🏳️
