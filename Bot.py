@@ -6187,4 +6187,796 @@ async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: 
             elif p1_id in surrendered_players:
                 winner = p2_name; surrendered_players.discard(p1_id)
                 log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                log2.append(loc(p2_lang, f"🏳️
+                log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
+                break
+            elif p2_id in surrendered_players:
+                winner = p1_name
+                surrendered_players.discard(p2_id)
+                log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
+                log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
+                break
+
+            t1_a = [c for c in t1 if c['hp'] > 0]
+            t2_a = [c for c in t2 if c['hp'] > 0]
+            if not t1_a and not t2_a: winner = "Draw"; break
+            elif not t1_a: winner = p2_name; break
+            elif not t2_a: winner = p1_name; break
+            if turn > 40: winner = "Timeout Draw"; break
+
+            did_turn, h = await execute_turn(t1, t2, p1_name, p2_name, log1, log2, p1_lang, p2_lang)
+            p1_heals += h
+            if did_turn:
+                if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
+                try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
+                except Exception as e:
+                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                await battle_delay(p1_id, p2_id)
+
+            t2_a = [c for c in t2 if c['hp'] > 0]
+            if t2_a:
+                if time.time() - battle_start_time > 180:
+                    timeout_flag = True
+                    break
+                    
+                did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
+                p2_heals += h
+                if did_turn:
+                    if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
+                    try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                    try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
+                    except Exception as e:
+                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
+                    await battle_delay(p1_id, p2_id)
+            turn += 1
+
+        if timeout_flag:
+            txt1 = loc(p1_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
+            txt2 = loc(p2_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
+            try: await msg1.edit_text(txt1)
+            except: pass
+            try: await msg2.edit_text(txt2)
+            except: pass
+            return
+
+        await add_quest_progress(p1_id, 'q_pvp_played', 1)
+        await add_quest_progress(p2_id, 'q_pvp_played', 1)
+        if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
+        if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
+
+        # Логика выпадения уникального кода-награды (шанс 4%)
+        code_text_1 = ""
+        code_text_2 = ""
+        winner_user_id = None
+        
+        if "Draw" not in winner and "Ничья" not in winner:
+            if winner == p1_name: winner_user_id = p1_id
+            elif winner == p2_name: winner_user_id = p2_id
+            
+        if winner_user_id is not None:
+            if random.random() <= 0.04:
+                db = await get_db_connection()
+                try:
+                    # ВЫДАЕМ СЛУЧАЙНЫЙ КОД
+                    async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
+                        row = await cursor.fetchone()
+                        if row:
+                            code_val = row['code']
+                            await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
+                            await db.commit()
+                            dropped_msg_ru = f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n"
+                            dropped_msg_en = f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
+                            if winner_user_id == p1_id:
+                                code_text_1 = loc(p1_lang, dropped_msg_ru, dropped_msg_en)
+                            else:
+                                code_text_2 = loc(p2_lang, dropped_msg_ru, dropped_msg_en)
+                except Exception as e:
+                    logging.error(f"Reward Code Drop PvP Error: {e}")
+                finally:
+                    await db.close()
+
+        final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
+        final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
+        
+        try: await msg1.edit_text(final1, reply_markup=None)
+        except: pass
+        try: await msg2.edit_text(final2, reply_markup=None)
+        except: pass
+        
+    finally:
+        active_combats.discard(p1_id)
+        active_combats.discard(p2_id)
+
+# ========================================================================
+# ТРЕЙДЫ
+# ========================================================================
+@dp.message(Command("trade"))
+async def cmd_trade_request(message: types.Message, state: FSMContext):
+    if await check_ban(message.from_user.id): return
+    if message.from_user.id in active_combats or message.from_user.id in user_trades: return await message.answer("Busy!")
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (message.from_user.id,))
+    lang = user['lang'] if user else 'ru'
+    parts = message.text.split()
+    if len(parts) > 1:
+        message.text = parts[1]
+        await process_trade_target(message, state)
+    else:
+        await message.answer(loc(lang, "🤝 <b>ОБМЕН</b>\nВведите @username или ID игрока:", "🤝 <b>TRADE</b>\nEnter @username or ID:"))
+        await state.set_state(TradeState.waiting_target)
+        asyncio.create_task(clear_fsm_timeout(state, message.chat.id, 60))
+
+@dp.message(TradeState.waiting_target)
+async def process_trade_target(message: types.Message, state: FSMContext):
+    val = message.text.strip()
+    user = await fetch_one("SELECT * FROM users WHERE id=?", (message.from_user.id,))
+    lang = user['lang']
+    target_user = None
+    
+    if val.isdigit(): target_user = await fetch_one("SELECT * FROM users WHERE id = ?", (int(val),))
+    else: target_user = await fetch_one("SELECT * FROM users WHERE username = ?", (val.lstrip('@'),))
+        
+    if not target_user: return await message.answer("Not found.")
+    if target_user['id'] == message.from_user.id: return await message.answer("Self!")
+    if target_user['id'] in active_combats or target_user['id'] in user_trades: return await message.answer("Busy!")
+
+    challenger_name = get_display_name(user) + await get_user_titles_str(message.from_user.id, lang)
+    t_lang = target_user['lang']
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=loc(t_lang, "✅ Принять", "✅ Accept"), callback_data=f"tr_acc_{user['id']}"),
+         InlineKeyboardButton(text=loc(t_lang, "❌ Отклонить", "❌ Decline"), callback_data=f"tr_dec_{user['id']}")]
+    ])
+    
+    try:
+        await bot.send_message(target_user['id'], loc(t_lang, f"🤝 <b>{challenger_name}</b> предлагает обмен!", f"🤝 <b>{challenger_name}</b> offers a trade!"), reply_markup=kb)
+        await message.answer(loc(lang, "📨 Запрос отправлен.", "📨 Request sent."))
+        await log_user_action(message.from_user.id, f"Отправил запрос на трейд игроку {target_user['id']}")
+    except: await message.answer("Error.")
+    await state.clear()
+
+@dp.callback_query(F.data.startswith("tr_acc_"))
+async def callback_trade_accept(callback: types.CallbackQuery):
+    p1_id = int(callback.data.split("_")[2])
+    p2_id = callback.from_user.id
+    if p1_id in user_trades or p2_id in user_trades or p1_id in active_combats or p2_id in active_combats: return await callback.answer("Busy!", show_alert=True)
+        
+    p1 = await fetch_one("SELECT * FROM users WHERE id = ?", (p1_id,))
+    p2 = await fetch_one("SELECT * FROM users WHERE id = ?", (p2_id,))
+    
+    trade_id = f"tr_{p1_id}_{p2_id}_{int(time.time())}"
+    trade = {
+        'id': trade_id, 'p1': p1_id, 'p2': p2_id,
+        'p1_name': get_display_name(p1), 'p2_name': get_display_name(p2),
+        'p1_offer': {}, 'p2_offer': {},  
+        'p1_strings': {}, 'p2_strings': {}, 
+        'p1_ready': False, 'p2_ready': False,
+        'p1_confirmed': False, 'p2_confirmed': False,
+        'p1_msg': None, 'p2_msg': None,
+        'start_time': time.time(), 'status': 'ongoing',
+        'l1': p1['lang'], 'l2': p2['lang']
+    }
+    
+    active_trades[trade_id] = trade
+    user_trades[p1_id] = trade_id
+    user_trades[p2_id] = trade_id
+    
+    await log_user_action(p2_id, f"Принял запрос на трейд от {p1_id}")
+    
+    try:
+        msg1 = await bot.send_message(p1_id, await render_trade_text(trade, trade['l1']), reply_markup=get_trade_main_kb(trade, p1_id))
+        trade['p1_msg'] = msg1.message_id
+    except: pass
+    try:
+        msg2 = await bot.send_message(p2_id, await render_trade_text(trade, trade['l2']), reply_markup=get_trade_main_kb(trade, p2_id))
+        trade['p2_msg'] = msg2.message_id
+    except: pass
+    
+    try: await callback.message.delete()
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_dec_"))
+async def callback_trade_decline(callback: types.CallbackQuery):
+    p1_id = int(callback.data.split("_")[2])
+    try: await bot.send_message(p1_id, "❌ Declined.")
+    except: pass
+    try: await callback.message.edit_text("❌ Declined.")
+    except: pass
+    await callback.answer()
+
+async def render_trade_text(trade, lang="ru"):
+    text = loc(lang, "🤝 <b>ТОРГОВАЯ КОМНАТА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n", "🤝 <b>TRADE ROOM</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    
+    text += loc(lang, f"🔵 <b>Предлагает {trade['p1_name']}:</b>\n", f"🔵 <b>{trade['p1_name']} offers:</b>\n")
+    if not trade['p1_offer']: text += loc(lang, "  └ <i>Ничего</i>\n", "  └ <i>Nothing</i>\n")
+    else:
+        for inv_id, qty in trade['p1_offer'].items(): text += f"  └ {qty}x {trade['p1_strings'].get(inv_id, '?')}\n"
+            
+    text += loc(lang, f"\n🔴 <b>Предлагает {trade['p2_name']}:</b>\n", f"\n🔴 <b>{trade['p2_name']} offers:</b>\n")
+    if not trade['p2_offer']: text += loc(lang, "  └ <i>Ничего</i>\n", "  └ <i>Nothing</i>\n")
+    else:
+        for inv_id, qty in trade['p2_offer'].items(): text += f"  └ {qty}x {trade['p2_strings'].get(inv_id, '?')}\n"
+            
+    r_str = loc(lang, "✅ Готов", "✅ Ready")
+    w_str = loc(lang, "⏳ Выбирает...", "⏳ Choosing...")
+    p1_st = r_str if trade['p1_ready'] else w_str
+    p2_st = r_str if trade['p2_ready'] else w_str
+    
+    text += loc(lang, f"━━━━━━━━━━━━━━━━━━━━━━━━\n📊 <b>Статус:</b>\n", f"━━━━━━━━━━━━━━━━━━━━━━━━\n📊 <b>Status:</b>\n")
+    text += f"{trade['p1_name']}: {p1_st}\n{trade['p2_name']}: {p2_st}\n"
+    return text
+
+def get_trade_main_kb(trade, user_id):
+    if trade['status'] != 'ongoing': return None
+    lang = trade['l1'] if user_id == trade['p1'] else trade['l2']
+    kb = []
+    if trade['p1_ready'] and trade['p2_ready']:
+        is_conf = trade['p1_confirmed'] if user_id == trade['p1'] else trade['p2_confirmed']
+        if is_conf: kb.append([InlineKeyboardButton(text=loc(lang, "⏳ Ожидание...", "⏳ Waiting..."), callback_data="ignore")])
+        else: kb.append([InlineKeyboardButton(text=loc(lang, "🔒 ПОДТВЕРДИТЬ", "🔒 CONFIRM"), callback_data="tr_action_confirm")])
+    else:
+        kb.append([
+            InlineKeyboardButton(text=loc(lang, "➕ Добавить", "➕ Add"), callback_data="tr_menu_add"),
+            InlineKeyboardButton(text=loc(lang, "➖ Убрать", "➖ Remove"), callback_data="tr_menu_rem")
+        ])
+        is_ready = trade['p1_ready'] if user_id == trade['p1'] else trade['p2_ready']
+        if is_ready: kb.append([InlineKeyboardButton(text=loc(lang, "⏳ Ждем партнера...", "⏳ Waiting for partner..."), callback_data="ignore")])
+        else: kb.append([InlineKeyboardButton(text=loc(lang, "✅ ГОТОВ К ОБМЕНУ", "✅ READY"), callback_data="tr_action_ready")])
+            
+    kb.append([InlineKeyboardButton(text=loc(lang, "❌ Отменить трейд", "❌ Cancel Trade"), callback_data="tr_action_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+async def update_trade_uis(trade):
+    try: await bot.edit_message_text(await render_trade_text(trade, trade['l1']), chat_id=trade['p1'], message_id=trade['p1_msg'], reply_markup=get_trade_main_kb(trade, trade['p1']))
+    except: pass
+    try: await bot.edit_message_text(await render_trade_text(trade, trade['l2']), chat_id=trade['p2'], message_id=trade['p2_msg'], reply_markup=get_trade_main_kb(trade, trade['p2']))
+    except: pass
+
+@dp.callback_query(F.data.startswith("tr_action_"))
+async def cb_trade_actions(callback: types.CallbackQuery):
+    action = callback.data.split("_")[2]
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer("Error", show_alert=True)
+    trade = active_trades[trade_id]
+    
+    if action == "cancel":
+        trade['status'] = 'cancelled'
+        try: await bot.edit_message_text("❌ Cancelled.", chat_id=trade['p1'], message_id=trade['p1_msg'])
+        except: pass
+        try: await bot.edit_message_text("❌ Cancelled.", chat_id=trade['p2'], message_id=trade['p2_msg'])
+        except: pass
+        user_trades.pop(trade['p1'], None)
+        user_trades.pop(trade['p2'], None)
+        active_trades.pop(trade_id, None)
+        return await callback.answer()
+        
+    if action == "ready":
+        if user_id == trade['p1']: trade['p1_ready'] = True
+        else: trade['p2_ready'] = True
+        await update_trade_uis(trade)
+        return await callback.answer()
+        
+    if action == "confirm":
+        if user_id == trade['p1']: trade['p1_confirmed'] = True
+        else: trade['p2_confirmed'] = True
+        await update_trade_uis(trade)
+        if trade['p1_confirmed'] and trade['p2_confirmed']: await execute_trade(trade_id)
+    await callback.answer()
+
+async def cancel_trade(trade_id, reason="Cancelled"):
+    trade = active_trades.pop(trade_id, None)
+    if not trade: return
+    user_trades.pop(trade['p1'], None)
+    user_trades.pop(trade['p2'], None)
+    try: await bot.edit_message_text(f"❌ {reason}", chat_id=trade['p1'], message_id=trade['p1_msg'])
+    except: pass
+    try: await bot.edit_message_text(f"❌ {reason}", chat_id=trade['p2'], message_id=trade['p2_msg'])
+    except: pass
+
+async def get_inv_item_details(inv_id):
+    row = await fetch_one("""
+        SELECT c.id as card_id, c.name, c.rarity, c.class_type, i.count, i.mutation, i.serial_number, i.signed_by, u.username, u.first_name
+        FROM inventory i JOIN cards c ON i.card_id = c.id LEFT JOIN users u ON i.signed_by = u.id
+        WHERE i.id = ?
+    """, (inv_id,))
+    if not row: return None
+    if row['signed_by'] != 0: row['signer_name'] = get_display_name({'username': row['username'], 'first_name': row['first_name']})
+    return row
+
+@dp.callback_query(F.data == "tr_menu_add")
+async def cb_trade_menu_add(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    lang = trade['l1'] if user_id == trade['p1'] else trade['l2']
+    
+    trade['p1_ready'] = False; trade['p2_ready'] = False
+    trade['p1_confirmed'] = False; trade['p2_confirmed'] = False
+    
+    inv = await fetch_all("""
+        SELECT c.id as card_id, c.name, c.rarity, c.class_type, i.id as inv_id, i.count, i.mutation, i.serial_number, i.signed_by, u.username, u.first_name
+        FROM inventory i JOIN cards c ON i.card_id = c.id LEFT JOIN users u ON i.signed_by = u.id
+        WHERE i.user_id = ? AND i.count > 0
+    """, (user_id,))
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
+    
+    items = []
+    for c in inv:
+        avail = c['count'] - offer_dict.get(c['inv_id'], 0)
+        if avail > 0:
+            if c['signed_by'] != 0: c['signer_name'] = get_display_name({'username': c['username'], 'first_name': c['first_name']})
+            n = format_card_name_plain(c)
+            mut = "⭐ " if c['mutation'] == 'Gold' else ("🌈 " if c['mutation'] == 'Rainbow' else "")
+            items.append({"id": c['inv_id'], "btn_text": f"{mut}{n} ({avail})"})
+            
+    kb = get_pagination_keyboard(items, 0, "tr_add", columns=1, items_per_page=6)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
+    try: await callback.message.edit_text("👇", reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_add_page_"))
+async def cb_trade_add_paginate(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[3])
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    
+    inv = await fetch_all("""
+        SELECT c.id as card_id, c.name, c.rarity, c.class_type, i.id as inv_id, i.count, i.mutation, i.serial_number, i.signed_by, u.username, u.first_name
+        FROM inventory i JOIN cards c ON i.card_id = c.id LEFT JOIN users u ON i.signed_by = u.id
+        WHERE i.user_id = ? AND i.count > 0
+    """, (user_id,))
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
+    items = []
+    for c in inv:
+        avail = c['count'] - offer_dict.get(c['inv_id'], 0)
+        if avail > 0:
+            if c['signed_by'] != 0: c['signer_name'] = get_display_name({'username': c['username'], 'first_name': c['first_name']})
+            n = format_card_name_plain(c)
+            mut = "⭐ " if c['mutation'] == 'Gold' else ("🌈 " if c['mutation'] == 'Rainbow' else "")
+            items.append({"id": c['inv_id'], "btn_text": f"{mut}{n} ({avail})"})
+            
+    kb = get_pagination_keyboard(items, page, "tr_add", columns=1, items_per_page=6)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
+    try: await callback.message.edit_reply_markup(reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_add_"))
+async def cb_trade_do_add(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    inv_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    string_dict = trade['p1_strings'] if user_id == trade['p1'] else trade['p2_strings']
+    
+    row = await get_inv_item_details(inv_id)
+    if not row: return await callback.answer("Not found!", show_alert=True)
+    
+    avail = row['count'] - offer_dict.get(inv_id, 0)
+    if avail <= 0: return await callback.answer("Limit!", show_alert=True)
+    
+    offer_dict[inv_id] = offer_dict.get(inv_id, 0) + 1
+    mut = "⭐ " if row['mutation'] == 'Gold' else ("🌈 " if row['mutation'] == 'Rainbow' else "")
+    string_dict[inv_id] = f"{mut}{format_card_name_plain(row)}"
+    
+    trade['p1_ready'] = False; trade['p2_ready'] = False
+    trade['p1_confirmed'] = False; trade['p2_confirmed'] = False
+    
+    await callback.answer(f"Added!")
+    await update_trade_uis(trade)
+
+@dp.callback_query(F.data == "tr_menu_rem")
+async def cb_trade_menu_rem(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    string_dict = trade['p1_strings'] if user_id == trade['p1'] else trade['p2_strings']
+    trade['p1_ready'] = False; trade['p2_ready'] = False
+    trade['p1_confirmed'] = False; trade['p2_confirmed'] = False
+    
+    items = []
+    for i_id, qty in offer_dict.items():
+        if qty > 0: items.append({"id": i_id, "btn_text": f"❌ {string_dict[i_id]} (x{qty})"})
+            
+    kb = get_pagination_keyboard(items, 0, "tr_rem", columns=1, items_per_page=6)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
+    try: await callback.message.edit_text("👇", reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_rem_page_"))
+async def cb_trade_rem_paginate(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[3])
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    string_dict = trade['p1_strings'] if user_id == trade['p1'] else trade['p2_strings']
+    
+    items = []
+    for i_id, qty in offer_dict.items():
+        if qty > 0: items.append({"id": i_id, "btn_text": f"❌ {string_dict[i_id]} (x{qty})"})
+            
+    kb = get_pagination_keyboard(items, page, "tr_rem", columns=1, items_per_page=6)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
+    try: await callback.message.edit_reply_markup(reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_rem_"))
+async def cb_trade_do_rem(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    inv_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    
+    if offer_dict.get(inv_id, 0) > 0:
+        offer_dict[inv_id] -= 1
+        if offer_dict[inv_id] == 0: del offer_dict[inv_id]
+            
+    trade['p1_ready'] = False; trade['p2_ready'] = False
+    trade['p1_confirmed'] = False; trade['p2_confirmed'] = False
+    
+    await callback.answer("-1")
+    await update_trade_uis(trade)
+
+@dp.callback_query(F.data == "tr_menu_main")
+async def cb_trade_menu_main(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    await update_trade_uis(active_trades[trade_id])
+    await callback.answer()
+
+async def execute_trade(trade_id):
+    trade = active_trades.pop(trade_id, None)
+    if not trade: return
+    user_trades.pop(trade['p1'], None)
+    user_trades.pop(trade['p2'], None)
+    
+    db = await get_db_connection()
+    try:
+        await db.execute("BEGIN")
+        async def transfer_items(from_u, to_u, offer):
+            for i_id, qty in offer.items():
+                cur = await db.execute("SELECT card_id, mutation, serial_number, signed_by, count FROM inventory WHERE id = ?", (i_id,))
+                row = await cur.fetchone()
+                if not row or row['count'] < qty: raise Exception("Not enough")
+                
+                if row['count'] == qty:
+                    await db.execute("DELETE FROM inventory WHERE id = ?", (i_id,))
+                    await db.execute("UPDATE users SET equip1 = 0 WHERE equip1 = ?", (i_id,))
+                    await db.execute("UPDATE users SET equip2 = 0 WHERE equip2 = ?", (i_id,))
+                    await db.execute("UPDATE users SET equip3 = 0 WHERE equip3 = ?", (i_id,))
+                    await db.execute("UPDATE users SET equip4 = 0 WHERE equip4 = ?", (i_id,))
+                else:
+                    await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, i_id))
+                    
+                cur2 = await db.execute("SELECT id FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND serial_number = ? AND signed_by = ?", (to_u, row['card_id'], row['mutation'], row['serial_number'], row['signed_by']))
+                dest = await cur2.fetchone()
+                
+                if dest: await db.execute("UPDATE inventory SET count = count + ? WHERE id = ?", (qty, dest['id']))
+                else: await db.execute("INSERT INTO inventory (user_id, card_id, count, mutation, serial_number, signed_by) VALUES (?, ?, ?, ?, ?, ?)", (to_u, row['card_id'], qty, row['mutation'], row['serial_number'], row['signed_by']))
+
+        await transfer_items(trade['p1'], trade['p2'], trade['p1_offer'])
+        await transfer_items(trade['p2'], trade['p1'], trade['p2_offer'])
+        await db.commit()
+        success = True
+    except Exception as e:
+        await db.execute("ROLLBACK")
+        success = False
+    finally:
+        await db.close()
+        
+    if success:
+        await log_user_action(trade['p1'], f"Успешно завершил трейд с {trade['p2']}")
+        await log_user_action(trade['p2'], f"Успешно завершил трейд с {trade['p1']}")
+        try: await bot.edit_message_text(loc(trade['l1'], "🎉 <b>ОБМЕН ЗАВЕРШЕН!</b>", "🎉 <b>TRADE COMPLETE!</b>"), chat_id=trade['p1'], message_id=trade['p1_msg'])
+        except: pass
+        try: await bot.edit_message_text(loc(trade['l2'], "🎉 <b>ОБМЕН ЗАВЕРШЕН!</b>", "🎉 <b>TRADE COMPLETE!</b>"), chat_id=trade['p2'], message_id=trade['p2_msg'])
+        except: pass
+    else:
+        try: await bot.edit_message_text("❌ ERROR", chat_id=trade['p1'], message_id=trade['p1_msg'])
+        except: pass
+        try: await bot.edit_message_text("❌ ERROR", chat_id=trade['p2'], message_id=trade['p2_msg'])
+        except: pass
+
+async def trade_timeout_task():
+    while True:
+        try:
+            now = time.time()
+            to_cancel = []
+            for t_id, trade in active_trades.items():
+                if now - trade['start_time'] > 600:
+                    to_cancel.append(t_id)
+            for t_id in to_cancel:
+                await cancel_trade(t_id, reason="Timeout")
+        except Exception as e: pass
+        await asyncio.sleep(60)
+
+# ========================================================================
+# СИД-ПАКИ
+# ========================================================================
+@dp.message(F.text.in_(BTN_SEED_PACKS))
+async def cmd_seed_packs_menu(message: types.Message):
+    if await check_ban(message.from_user.id): return
+    user = await fetch_one("SELECT coins, lang FROM users WHERE id = ?", (message.from_user.id,))
+    lang = user['lang']
+    packs = await fetch_all("SELECT * FROM seed_packs")
+    
+    text = loc(lang,
+        f"📦 <b>МАГАЗИН СИД-ПАКОВ</b>\n💰 Твой баланс: <b>{user['coins']} Шекелей</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nСид-Пак — это особый набор карт с гарантированным набором юнитов и повышенным шансом мутаций (<b>12% на Золотую</b>, <b>2% на Радужную</b>)!\n\nДоступные паки:\n",
+        f"📦 <b>SEED-PACK SHOP</b>\n💰 Balance: <b>{user['coins']} Shekels</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nSeed-Pack is a special pack with guaranteed units and boosted mutations (<b>12% Gold</b>, <b>2% Rainbow</b>)!\n\nAvailable packs:\n"
+    )
+    
+    kb = []
+    if not packs:
+        text += loc(lang, "\n<i>Пусто. Ожидайте!</i>", "\n<i>Empty. Wait!</i>")
+    else:
+        for p in packs:
+            desc_text = f" — {p['description']}" if p['description'] else ""
+            price_val = p.get('price', 2000)
+            text += f"🔹 <b>{p['title']}</b> (Цена: <b>{price_val} 💰</b>){desc_text}\n"
+            kb.append([InlineKeyboardButton(text=loc(lang, f"🔍 Смотреть: {p['title']}", f"🔍 View: {p['title']}"), callback_data=f"sp_view_{p['id']}_shop")])
+            
+    await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("sp_view_"))
+async def cb_sp_view(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    pack_id = int(parts[2])
+    mode = parts[3] 
+    user_id = callback.from_user.id
+    user = await fetch_one("SELECT coins, lang FROM users WHERE id=?", (user_id,))
+    lang = user['lang']
+    
+    pack = await fetch_one("SELECT * FROM seed_packs WHERE id = ?", (pack_id,))
+    if not pack: return await callback.answer("Error!", show_alert=True)
+    
+    pack_cards = await fetch_all("SELECT c.name, spc.drop_chance FROM seed_pack_cards spc JOIN cards c ON spc.card_id = c.id WHERE spc.pack_id = ?", (pack_id,))
+    pack_price = pack.get('price', 2000)
+    
+    text = loc(lang, f"📦 <b>СИД-ПАК: {pack['title']}</b>\n💬 <i>{pack['description']}</i>\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 <b>Содержимое пака:</b>\n", f"📦 <b>SEED-PACK: {pack['title']}</b>\n💬 <i>{pack['description']}</i>\n━━━━━━━━━━━━━━━━━━━━━━━━\n📊 <b>Contents:</b>\n")
+    if not pack_cards:
+        text += loc(lang, "  └ <i>Пак пуст!</i>\n", "  └ <i>Pack is empty!</i>\n")
+    else:
+        total_w = sum(c['drop_chance'] for c in pack_cards)
+        for idx, c in enumerate(pack_cards, 1):
+            chance_pct = (c['drop_chance'] / total_w) * 100 if total_w > 0 else 0
+            text += f"  {idx}. {c['name']} (~{chance_pct:.2f}%)\n"
+            
+    kb = []
+    if mode == "shop":
+        text += loc(lang, f"\n💰 Ваш баланс: <b>{user['coins']} Шекелей</b>\nЦена: <b>{pack_price} 💰</b> за штуку.", f"\n💰 Balance: <b>{user['coins']} Shekels</b>\nPrice: <b>{pack_price} 💰</b> each.")
+        kb.append([InlineKeyboardButton(text=loc(lang, f"🛒 Купить x1", f"🛒 Buy x1"), callback_data=f"sp_buy_{pack_id}_1")])
+        kb.append([InlineKeyboardButton(text=f"x3 ({pack_price * 3} 💰)", callback_data=f"sp_buy_{pack_id}_3"), InlineKeyboardButton(text=f"x10 ({pack_price * 10} 💰)", callback_data=f"sp_buy_{pack_id}_10")])
+        kb.append([InlineKeyboardButton(text=loc(lang, "🔙 Назад в магазин", "🔙 Back to Shop"), callback_data="sp_shop_back")])
+    elif mode == "inv":
+        user_pack = await fetch_one("SELECT count FROM user_seed_packs WHERE user_id = ? AND pack_id = ?", (user_id, pack_id))
+        amount = user_pack['count'] if user_pack else 0
+        text += loc(lang, f"\nУ вас есть: <b>{amount} шт.</b>\n", f"\nYou have: <b>{amount} pcs.</b>\n")
+        if amount > 0:
+            kb.append([InlineKeyboardButton(text=loc(lang, "📦 Открыть x1", "📦 Open x1"), callback_data=f"sp_open_{pack_id}_1")])
+            if amount >= 5:
+                kb.append([InlineKeyboardButton(text=loc(lang, "📦 Открыть x5", "📦 Open x5"), callback_data=f"sp_open_{pack_id}_5")])
+            kb.append([InlineKeyboardButton(text=loc(lang, "📦 Открыть ВСЕ", "📦 Open ALL"), callback_data=f"sp_open_{pack_id}_all")])
+        kb.append([InlineKeyboardButton(text=loc(lang, "🔙 Назад в инвентарь", "🔙 Back to Inventory"), callback_data="sp_inv_back")])
+
+    try: await callback.message.edit_caption(caption=text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    except:
+        try: await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+        except: pass
+
+@dp.callback_query(F.data == "sp_shop_back")
+async def cb_sp_shop_back(callback: types.CallbackQuery):
+    await cmd_seed_packs_menu(callback.message)
+    await callback.message.delete()
+    await callback.answer()
+
+@dp.callback_query(F.data == "sp_inv_back")
+async def cb_sp_inv_back(callback: types.CallbackQuery):
+    await cb_inv_packs_menu(callback)
+
+@dp.callback_query(F.data == "inv_packs_menu")
+async def cb_inv_packs_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (user_id,))
+    lang = user['lang'] if user else 'ru'
+    
+    user_packs = await fetch_all("""
+        SELECT usp.count, sp.id as pack_id, sp.title
+        FROM user_seed_packs usp JOIN seed_packs sp ON usp.pack_id = sp.id
+        WHERE usp.user_id = ? AND usp.count > 0
+    """, (user_id,))
+    
+    text = loc(lang, "🎒 <b>ИНВЕНТАРЬ СИД-ПАКОВ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите пак для распаковки:\n\n", "🎒 <b>SEED-PACK INVENTORY</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nSelect pack to open:\n\n")
+    
+    kb = [[InlineKeyboardButton(text=loc(lang, "🎒 Карты", "🎒 Cards"), callback_data="inv_cards_menu"), InlineKeyboardButton(text=loc(lang, "📦 Сид-Паки (Выбрано)", "📦 Seed-Packs (Selected)"), callback_data="ignore")]]
+    
+    if not user_packs: text += loc(lang, "<i>У вас нет Сид-Паков.</i>", "<i>You have no Seed-Packs.</i>")
+    else:
+        for p in user_packs:
+            text += f"📦 <b>{p['title']}</b> — <b>{p['count']} шт.</b>\n"
+            kb.append([InlineKeyboardButton(text=loc(lang, f"🔍 Смотреть: {p['title']}", f"🔍 View: {p['title']}"), callback_data=f"sp_view_{p['pack_id']}_inv")])
+            
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data == "inv_cards_menu")
+async def cb_inv_cards_menu(callback: types.CallbackQuery):
+    text, kb = await get_inventory_text_and_kb(callback.from_user.id, 0)
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sp_buy_"))
+async def cb_sp_buy_fixed(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    pack_id = int(parts[2])
+    amount = int(parts[3])
+    user_id = callback.from_user.id
+    
+    user = await fetch_one("SELECT coins, lang FROM users WHERE id=?", (user_id,))
+    lang = user['lang']
+    pack = await fetch_one("SELECT title, price FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not pack: return await callback.answer("Error!", show_alert=True)
+    
+    pack_price = pack['price'] if pack.get('price') is not None else 2000
+    total_cost = pack_price * amount
+    
+    if user['coins'] < total_cost:
+        return await callback.answer(loc(lang, "❌ Недостаточно шекелей!", "❌ Not enough shekels!"), show_alert=True)
+        
+    await execute_db("UPDATE users SET coins = coins - ? WHERE id = ?", (total_cost, user_id))
+    await execute_db("""
+        INSERT INTO user_seed_packs (user_id, pack_id, count)
+        VALUES (?, ?, ?)
+        ON CONFLICT(user_id, pack_id) DO UPDATE SET count = count + ?
+    """, (user_id, pack_id, amount, amount))
+    
+    await add_quest_progress(user_id, 'q_shop_buys', 1)
+    await log_user_action(user_id, f"Купил Сид-Пак '{pack['title']}' x{amount} за {total_cost}💰")
+    
+    await callback.answer(loc(lang, f"✅ Куплено {amount} шт. Сид-Паков «{pack['title']}»!", f"✅ Bought {amount}x '{pack['title']}' Seed-Packs!"), show_alert=True)
+    
+    new_callback = callback.model_copy(update={"data": f"sp_view_{pack_id}_shop"})
+    await cb_sp_view(new_callback)
+
+@dp.callback_query(F.data.startswith("sp_open_"))
+async def cb_sp_open_fixed(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    pack_id = int(parts[2])
+    amt_str = parts[3]
+    user_id = callback.from_user.id
+    
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (user_id,))
+    lang = user['lang']
+    user_pack = await fetch_one("SELECT count FROM user_seed_packs WHERE user_id = ? AND pack_id = ?", (user_id, pack_id))
+    pack = await fetch_one("SELECT title, photo_id FROM seed_packs WHERE id = ?", (pack_id,))
+    
+    if not user_pack or user_pack['count'] <= 0: return await callback.answer(loc(lang, "❌ У вас нет этого пака!", "❌ You don't have this pack!"), show_alert=True)
+        
+    amount = user_pack['count'] if amt_str == 'all' else int(amt_str)
+    if amount > user_pack['count']: return await callback.answer("Error amount", show_alert=True)
+    
+    await execute_db("UPDATE user_seed_packs SET count = count - ? WHERE user_id = ? AND pack_id = ?", (amount, user_id, pack_id))
+    pack_cards = await fetch_all("SELECT card_id, drop_chance FROM seed_pack_cards WHERE pack_id = ?", (pack_id,))
+    
+    if not pack_cards:
+        await execute_db("UPDATE user_seed_packs SET count = count + ? WHERE user_id = ? AND pack_id = ?", (amount, user_id, pack_id))
+        return await callback.answer("Empty pack DB error", show_alert=True)
+        
+    luck_mult, _ = await get_active_events()
+    weights = []
+    cards_list = []
+    for pc in pack_cards:
+        w = pc['drop_chance']
+        if w < 15.0: w *= luck_mult
+        weights.append(w)
+        card_info = await fetch_one("SELECT * FROM cards WHERE id = ?", (pc['card_id'],))
+        cards_list.append(card_info)
+        
+    won_cards = []
+    for _ in range(amount):
+        won_card = random.choices(cards_list, weights=weights, k=1)[0]
+        mut = roll_seed_pack_mutation() 
+        _, serial, _ = await give_card_to_user(user_id, won_card['id'], mut, won_card['rarity'])
+        
+        c_copy = dict(won_card)
+        c_copy['mutation'] = mut
+        c_copy['serial_number'] = serial
+        won_cards.append(c_copy)
+        
+    await add_quest_progress(user_id, 'q_cards_opened', amount)
+    await log_user_action(user_id, f"Открыл Сид-Пак '{pack['title']}' x{amount}")
+    
+    text_results = loc(lang, f"🎉 <b>РАСПАКОВКА {amount}x СИД-ПАКА «{pack['title']}» ЗАВЕРШЕНА!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n", f"🎉 <b>OPENED {amount}x SEED-PACK '{pack['title']}'!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    
+    if amount == 1:
+        single = won_cards[0]
+        mut_str = loc(lang, "🌈 Радужная " if single['mutation'] == 'Rainbow' else ("⭐ Золотая " if single['mutation'] == 'Gold' else ""), "🌈 Rainbow " if single['mutation'] == 'Rainbow' else ("⭐ Gold " if single['mutation'] == 'Gold' else ""))
+        mult = get_mutation_multiplier(single['mutation'])
+        
+        caption_text = text_results + f"🃏 {mut_str}{format_card_name(single)}\n💎 {format_rarity_display(single['rarity'])}\n"
+        if single['class_type'] == 'Booster': 
+            caption_text += f"✨ <b>БУСТЕР</b>\n⚔️ DMG Mult: <b>x{round(single['booster_dmg_mult']*mult, 2)}</b> | ❤️ HP Mult: <b>x{round(single['booster_hp_mult']*mult, 2)}</b>\n"
+        elif single['class_type'] == 'Healer':
+            caption_text += f"💗 <b>Лечение:</b> {int(single['damage']*mult)} | ❤️ <b>Здоровье:</b> {int(single['hp']*mult)}\n"
+        else: 
+            caption_text += f"⚔️ <b>Урон:</b> {int(single['damage']*mult)} | ❤️ <b>Здоровье:</b> {int(single['hp']*mult)}\n"
+            
+        await callback.message.answer_photo(photo=single['photo_id'], caption=caption_text)
+        await callback.message.delete()
+    else:
+        for idx, c in enumerate(won_cards, 1):
+            mut_str = "🌈 " if c['mutation'] == 'Rainbow' else ("⭐ " if c['mutation'] == 'Gold' else "⚪ ")
+            text_results += f"{idx}. {mut_str}{format_card_name(c)}\n"
+        text_results += loc(lang, "\n<i>Все карты добавлены в 🎒 Инвентарь.</i>", "\n<i>All cards added to 🎒 Inventory.</i>")
+        await callback.message.answer(text_results)
+        await callback.message.delete()
+        
+    new_callback = callback.model_copy(update={"data": f"sp_view_{pack_id}_inv"})
+    await cb_sp_view(new_callback)
+
+async def main():
+    await check_and_update_schema()
+    
+    shop_exists = await fetch_all("SELECT * FROM shop_items")
+    if not shop_exists: await restock_shop()
+    
+    settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
+    if settings and settings['last_lb_reward'] == 0:
+        await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (time.time(),))
+    
+    asyncio.create_task(shop_auto_restock_task())
+    asyncio.create_task(leaderboard_rewards_task())
+    asyncio.create_task(trade_timeout_task())
+    asyncio.create_task(auto_backup_db())
+    
+    commands = [
+        BotCommand(command="start", description="Главное меню / Main Menu"),
+        BotCommand(command="getcard", description="Выбить карту / Draw Card"),
+        BotCommand(command="shop", description="Магазин / Shop"),
+        BotCommand(command="inventory", description="Инвентарь / Inventory"),
+        BotCommand(command="equip", description="Экипировка колоды / Equip Deck"),
+        BotCommand(command="profile", description="Профиль и статы / Profile & Stats"),
+        BotCommand(command="trade", description="Обменяться картами / Trade Cards"),
+        BotCommand(command="quests", description="Квесты / Quests"),
+        BotCommand(command="index", description="Индекс всех карт / Card Index"),
+        BotCommand(command="top", description="Рейтинг игроков / Leaderboard"),
+        BotCommand(command="codereward", description="Активировать код / Redeem Code")
+    ]
+    await bot.set_my_commands(commands)
+    
+    logging.info("🤖 Карточный бот успешно перезапущен (Healer + 4 слота + Уведомления стока + Моды + Фиксы кодов + Баланс)!")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
