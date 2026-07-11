@@ -469,8 +469,12 @@ async def check_and_update_schema():
             )
         """)
 
-        teams_count = await fetch_one("SELECT COUNT(*) as c FROM league_teams")
-        if teams_count and teams_count['c'] == 0:
+        # ИСПРАВЛЕНИЕ ОШИБКИ ЗДЕСЬ: используем текущее соединение `db` вместо `fetch_one`, 
+        # которое открывало новое соединение до фиксации (commit) создания таблицы.
+        async with db.execute("SELECT COUNT(*) as c FROM league_teams") as cursor:
+            teams_count = await cursor.fetchone()
+            
+        if teams_count and dict(teams_count)['c'] == 0:
             for i in range(1, 9):
                 await db.execute("INSERT INTO league_teams (id, name, score) VALUES (?, ?, 0)", (i, f"Команда {i}"))
 
@@ -3475,7 +3479,7 @@ async def update_trade_uis(trade):
 @dp.callback_query(F.data.startswith("tr_action_"))
 async def cb_trade_actions(callback: types.CallbackQuery):
     action = callback.data.split("_")[2]
-    user_id = callback.from_user.id
+    user_id = callback.fromuser.id
     trade_id = user_trades.get(user_id)
     if not trade_id or trade_id not in active_trades: return await callback.answer("Error", show_alert=True)
     trade = active_trades[trade_id]
@@ -5851,7 +5855,7 @@ async def cb_sp_edit_field(callback: types.CallbackQuery, state: FSMContext):
         await callback.message.answer("Введите НОВОЕ описание для Сид-Пака:")
         await state.set_state(EditSeedPack.edit_description)
     elif field == "photo":
-        kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить (Удалить фото)")]], resize_keyboard=True)
+        kb = ReplyKeyboardMarkup(keyboard=[[KeyboardButton(text="Пропустить (Удалить фото)")], [KeyboardButton(text="Отмена")]], resize_keyboard=True)
         await callback.message.answer("Отправьте новое ФОТО для Сид-Пака (или нажмите кнопку снизу):", reply_markup=kb)
         await state.set_state(EditSeedPack.edit_photo)
     elif field == "price":
@@ -5903,6 +5907,11 @@ async def adm_sp_edit_photo_save(message: types.Message, state: FSMContext):
     data = await state.get_data()
     pack_id = data['editing_pack_id']
     
+    if message.text == "Отмена":
+        await message.answer("Отменено.", reply_markup=ReplyKeyboardRemove())
+        fake_call = FakeCall(message, f"sp_edit_pack_id_{pack_id}")
+        return await cb_adm_sp_edit_menu(fake_call, state)
+        
     photo_id = None
     if message.photo:
         photo_id = message.photo[-1].file_id
