@@ -6011,4 +6011,805 @@ async def cq_sp_edit_manage_cards(callback: types.CallbackQuery, state: FSMConte
     
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.
+@dp.callback_query(F.data == "adm_craft_main")
+async def adm_craft_main(callback: types.CallbackQuery):
+    if not await is_admin(callback.from_user.id): return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать рецепт", callback_data="adm_craft_create")],
+        [InlineKeyboardButton(text="✏️ Изменить рецепт", callback_data="adm_craft_edit_list")],
+        [InlineKeyboardButton(text="🗑 Удалить рецепт", callback_data="adm_craft_delete")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
+    ])
+    await callback.message.edit_text("🔨 <b>Управление Рецептами Крафта</b>\nЗдесь вы можете настраивать рецепты для создания карт.", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_craft_edit_list")
+async def adm_craft_edit_list(callback: types.CallbackQuery):
+    recipes = await fetch_all("SELECT r.id, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id")
+    if not recipes: return await callback.answer("Нет рецептов.", show_alert=True)
+    
+    kb = []
+    for r in recipes:
+        kb.append([InlineKeyboardButton(text=f"✏️ Изменить: {r['name']}", callback_data=f"adm_cr_ed_{r['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_craft_main")])
+    await callback.message.edit_text("Выберите рецепт для изменения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("adm_cr_ed_"))
+async def adm_craft_edit_menu(callback: types.CallbackQuery, state: FSMContext):
+    r_id = int(callback.data.split("_")[3])
+    await state.update_data(editing_recipe_id=r_id)
+    await show_craft_edit_menu(callback.message, state)
+    await callback.answer()
+
+async def show_craft_edit_menu(message_or_call, state: FSMContext):
+    data = await state.get_data()
+    r_id = data['editing_recipe_id']
+    recipe = await fetch_one("SELECT r.id, r.price, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id WHERE r.id = ?", (r_id,))
+    ingredients = await fetch_all("SELECT i.id as ing_id, c.name, i.amount FROM craft_ingredients i JOIN cards c ON i.card_id = c.id WHERE i.recipe_id = ?", (r_id,))
+    
+    text = f"🔨 <b>Изменение рецепта: {recipe['name']}</b>\nЦена крафта: <b>{recipe['price']} 💰</b>\n\nИнгредиенты:\n"
+    if not ingredients: text += "<i>Пусто</i>\n"
+    else:
+        for idx, ing in enumerate(ingredients, 1):
+            text += f"{idx}. {ing['name']} x{ing['amount']}\n"
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="cr_ed_price")],
+        [InlineKeyboardButton(text="➕ Добавить ингредиент", callback_data="cr_ed_add_ing")],
+        [InlineKeyboardButton(text="🗑 Удалить ингредиент", callback_data="cr_ed_del_ing")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_craft_edit_list")]
+    ])
+    
+    if isinstance(message_or_call, types.Message):
+        await message_or_call.answer(text, reply_markup=kb)
+    else:
+        await message_or_call.edit_text(text, reply_markup=kb)
+    await state.set_state(AdminCraftEdit.menu)
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_price")
+async def cr_ed_price(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите новую цену крафта в шекелях:")
+    await state.set_state(AdminCraftEdit.edit_price)
+    await callback.answer()
+
+@dp.message(AdminCraftEdit.edit_price)
+async def cr_ed_price_save(message: types.Message, state: FSMContext):
+    try:
+        price = int(message.text)
+        if price < 0: raise ValueError
+        data = await state.get_data()
+        r_id = data['editing_recipe_id']
+        await execute_db("UPDATE craft_recipes SET price = ? WHERE id = ?", (price, r_id))
+        await message.answer("✅ Цена обновлена!")
+        await show_craft_edit_menu(message, state)
+    except:
+        await message.answer("❌ Введите положительное число.")
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_add_ing")
+async def cr_ed_add_ing(callback: types.CallbackQuery, state: FSMContext):
+    all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"} for c in all_cards]
+    await state.update_data(craft_items=items)
+    kb = get_pagination_keyboard(items, 0, "cred_ing", columns=1, items_per_page=8)
+    await callback.message.edit_text("Выберите карту-ингредиент для добавления:", reply_markup=kb)
+    await state.set_state(AdminCraftEdit.add_ing_card)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftEdit.add_ing_card, F.data.startswith("cred_ing_page_"))
+async def cr_ed_add_ing_pag(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('craft_items', []), page, "cred_ing", columns=1, items_per_page=8)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftEdit.add_ing_card, F.data.startswith("cred_ing_"))
+async def cr_ed_add_ing_sel(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[2])
+    await state.update_data(cr_curr_ing=card_id)
+    await callback.message.edit_text("Введите количество требуемых штук (например: 5):")
+    await state.set_state(AdminCraftEdit.add_ing_amount)
+    await callback.answer()
+
+@dp.message(AdminCraftEdit.add_ing_amount)
+async def cr_ed_add_ing_amt(message: types.Message, state: FSMContext):
+    try:
+        amt = int(message.text)
+        if amt <= 0: raise ValueError
+        data = await state.get_data()
+        r_id = data['editing_recipe_id']
+        c_id = data['cr_curr_ing']
+        await execute_db("INSERT INTO craft_ingredients (recipe_id, card_id, amount) VALUES (?, ?, ?)", (r_id, c_id, amt))
+        await message.answer("✅ Ингредиент добавлен!")
+        await show_craft_edit_menu(message, state)
+    except:
+        await message.answer("❌ Число > 0.")
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_del_ing")
+async def cr_ed_del_ing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    r_id = data['editing_recipe_id']
+    ingredients = await fetch_all("SELECT i.id as ing_id, c.name, i.amount FROM craft_ingredients i JOIN cards c ON i.card_id = c.id WHERE i.recipe_id = ?", (r_id,))
+    if not ingredients: return await callback.answer("Нет ингредиентов для удаления.", show_alert=True)
+    
+    kb = []
+    for ing in ingredients:
+        kb.append([InlineKeyboardButton(text=f"🗑 {ing['name']} x{ing['amount']}", callback_data=f"cr_del_ing_{ing['ing_id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="cr_ed_back")])
+    await callback.message.edit_text("Выберите ингредиент для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cr_del_ing_"))
+async def cr_del_ing_action(callback: types.CallbackQuery, state: FSMContext):
+    ing_id = int(callback.data.split("_")[3])
+    await execute_db("DELETE FROM craft_ingredients WHERE id = ?", (ing_id,))
+    await callback.answer("✅ Ингредиент удален!", show_alert=True)
+    await show_craft_edit_menu(callback.message, state)
+
+@dp.callback_query(F.data == "cr_ed_back")
+async def cr_ed_back(callback: types.CallbackQuery, state: FSMContext):
+    await show_craft_edit_menu(callback.message, state)
+    await callback.answer()
+
+@dp.callback_query(F.data == "adm_craft_delete")
+async def adm_craft_del_list(callback: types.CallbackQuery):
+    recipes = await fetch_all("SELECT r.id, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id")
+    if not recipes: return await callback.answer("Нет рецептов.", show_alert=True)
+    
+    kb = []
+    for r in recipes:
+        kb.append([InlineKeyboardButton(text=f"🗑 Удалить: {r['name']}", callback_data=f"adm_cr_del_{r['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_craft_main")])
+    await callback.message.edit_text("Выберите рецепт для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("adm_cr_del_"))
+async def adm_craft_del_action(callback: types.CallbackQuery):
+    r_id = int(callback.data.split("_")[3])
+    await execute_db("DELETE FROM craft_recipes WHERE id = ?", (r_id,))
+    await execute_db("DELETE FROM craft_ingredients WHERE recipe_id = ?", (r_id,))
+    await callback.answer("✅ Рецепт удален!", show_alert=True)
+    await adm_craft_main(callback)
+
+@dp.callback_query(F.data == "adm_craft_create")
+async def adm_craft_cr_start(callback: types.CallbackQuery, state: FSMContext):
+    all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"} for c in all_cards]
+    await state.update_data(craft_items=items)
+    kb = get_pagination_keyboard(items, 0, "crc_target", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_craft_main")])
+    await callback.message.edit_text("🔨 <b>Шаг 1: Выберите карту, которая получится при крафте:</b>", reply_markup=kb)
+    await state.set_state(AdminCraftCreate.target_card)
+
+@dp.callback_query(AdminCraftCreate.target_card, F.data.startswith("crc_target_page_"))
+async def adm_craft_cr_paginate(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('craft_items', []), page, "crc_target", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_craft_main")])
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftCreate.target_card, F.data.startswith("crc_target_"))
+async def adm_craft_cr_select(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[2])
+    await state.update_data(cr_target=card_id, cr_ings=[])
+    await callback.message.edit_text("🔨 <b>Шаг 2: Введите цену крафта в Шекелях (например: 50000):</b>")
+    await state.set_state(AdminCraftCreate.price)
+    
+@dp.message(AdminCraftCreate.price)
+async def adm_craft_cr_price(message: types.Message, state: FSMContext):
+    try:
+        price = int(message.text)
+        if price < 0: raise ValueError
+        await state.update_data(cr_price=price)
+        await adm_craft_cr_show_menu(message, state)
+    except:
+        await message.answer("❌ Введите положительное число.")
+
+async def adm_craft_cr_show_menu(msg, state: FSMContext):
+    data = await state.get_data()
+    t_card = await fetch_one("SELECT name FROM cards WHERE id = ?", (data['cr_target'],))
+    
+    text = f"🔨 <b>Настройка Рецепта</b>\nЦель: <b>{t_card['name']}</b>\nЦена: <b>{data['cr_price']} 💰</b>\n\nИнгредиенты:\n"
+    if not data['cr_ings']: text += "<i>Пусто</i>\n"
+    else:
+        for idx, ing in enumerate(data['cr_ings'], 1):
+            c = await fetch_one("SELECT name FROM cards WHERE id = ?", (ing['card_id'],))
+            text += f"{idx}. {c['name']} x{ing['amount']}\n"
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ингредиент", callback_data="cr_add_ing")],
+        [InlineKeyboardButton(text="✅ Завершить и сохранить", callback_data="cr_save")]
+    ])
+    
+    if isinstance(msg, types.CallbackQuery): await msg.message.edit_text(text, reply_markup=kb)
+    else: await msg.answer(text, reply_markup=kb)
+    await state.set_state(AdminCraftCreate.add_ingredient_card)
+
+@dp.callback_query(AdminCraftCreate.add_ingredient_card, F.data == "cr_add_ing")
+async def adm_craft_add_ing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('craft_items', []), 0, "crc_ing", columns=1, items_per_page=8)
+    await callback.message.edit_text("Выберите карту-ингредиент:", reply_markup=kb)
+
+@dp.callback_query(AdminCraftCreate.add_ingredient_card, F.data.startswith("crc_ing_page_"))
+async def adm_craft_ing_pag(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('craft_items', []), page, "crc_ing", columns=1, items_per_page=8)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftCreate.add_ingredient_card, F.data.startswith("crc_ing_"))
+async def adm_craft_ing_sel(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[2])
+    await state.update_data(cr_curr_ing=card_id)
+    await callback.message.edit_text("Введите количество требуемых штук (например: 5):")
+    await state.set_state(AdminCraftCreate.add_ingredient_amount)
+
+@dp.message(AdminCraftCreate.add_ingredient_amount)
+async def adm_craft_ing_amt(message: types.Message, state: FSMContext):
+    try:
+        amt = int(message.text)
+        if amt <= 0: raise ValueError
+        data = await state.get_data()
+        data['cr_ings'].append({'card_id': data['cr_curr_ing'], 'amount': amt})
+        await state.update_data(cr_ings=data['cr_ings'])
+        await adm_craft_cr_show_menu(message, state)
+    except:
+        await message.answer("❌ Число > 0.")
+
+@dp.callback_query(AdminCraftCreate.add_ingredient_card, F.data == "cr_save")
+async def adm_craft_save(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data['cr_ings']: return await callback.answer("❌ Добавьте хотя бы 1 ингредиент!", show_alert=True)
+    
+    db = await get_db_connection()
+    try:
+        cur = await db.execute("INSERT INTO craft_recipes (target_card_id, price) VALUES (?, ?)", (data['cr_target'], data['cr_price']))
+        r_id = cur.lastrowid
+        for ing in data['cr_ings']:
+            await db.execute("INSERT INTO craft_ingredients (recipe_id, card_id, amount) VALUES (?, ?, ?)", (r_id, ing['card_id'], ing['amount']))
+        await db.commit()
+        await callback.message.edit_text("✅ Рецепт успешно создан!")
+    finally:
+        await db.close()
+    await state.clear()
+
+
+@dp.message(F.text.in_(BTN_CRAFT))
+@dp.message(Command("craft"))
+async def cmd_craft_menu(message: types.Message):
+    if await check_ban(message.from_user.id): return
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (message.from_user.id,))
+    lang = user['lang'] if user else 'ru'
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Рецепты", callback_data="craft_recipes_list")],
+        [InlineKeyboardButton(text="✨ Улучшение мутаций", callback_data="craft_upgrade_list")]
+    ])
+    await message.answer("🔨 <b>МАСТЕРСКАЯ КРАФТА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
+
+@dp.callback_query(F.data == "craft_menu_main")
+async def cb_craft_menu_main(callback: types.CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📜 Рецепты", callback_data="craft_recipes_list")],
+        [InlineKeyboardButton(text="✨ Улучшение мутаций", callback_data="craft_upgrade_list")]
+    ])
+    try: await callback.message.edit_text("🔨 <b>МАСТЕРСКАЯ КРАФТА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "craft_recipes_list")
+async def cb_craft_recipes_list(callback: types.CallbackQuery):
+    recipes = await fetch_all("SELECT r.id, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id")
+    if not recipes: return await callback.answer("Рецептов пока нет.", show_alert=True)
+    
+    items = [{"id": r['id'], "btn_text": f"🔨 {r['name']}"} for r in recipes]
+    kb = get_pagination_keyboard(items, 0, "craft_rec", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="craft_menu_main")])
+    await callback.message.edit_text("📜 <b>Доступные Рецепты</b>:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("craft_rec_page_"))
+async def cb_craft_recipes_pag(callback: types.CallbackQuery):
+    page = int(callback.data.split("_")[3])
+    recipes = await fetch_all("SELECT r.id, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id")
+    items = [{"id": r['id'], "btn_text": f"🔨 {r['name']}"} for r in recipes]
+    kb = get_pagination_keyboard(items, page, "craft_rec", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="craft_menu_main")])
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+async def render_recipe_ui(user_id, recipe_id):
+    recipe = await fetch_one("SELECT target_card_id, price FROM craft_recipes WHERE id = ?", (recipe_id,))
+    target_card = await fetch_one("SELECT name, photo_id, rarity FROM cards WHERE id = ?", (recipe['target_card_id'],))
+    ingredients = await fetch_all("SELECT id, card_id, amount FROM craft_ingredients WHERE recipe_id = ?", (recipe_id,))
+    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (user_id,))
+    
+    if user_id not in active_crafts or active_crafts[user_id]['recipe_id'] != recipe_id:
+        active_crafts[user_id] = {'recipe_id': recipe_id, 'ingredients': {}}
+        for ing in ingredients:
+            active_crafts[user_id]['ingredients'][ing['id']] = {'card_id': ing['card_id'], 'req': ing['amount'], 'filled': 0, 'selected': {}}
+            
+    craft_data = active_crafts[user_id]['ingredients']
+    
+    text = f"🔨 <b>КРАФТ: {target_card['name']}</b>\nСтоимость: {recipe['price']} 💰 (У вас: {user['coins']})\n━━━━━━━━━━━━━━━━━━━━━━━━\nТребования:\n"
+    
+    all_filled = True
+    total_req = sum(i['amount'] for i in ingredients)
+    total_gold = 0
+    total_rainbow = 0
+    
+    kb_btns = []
+    
+    for idx, ing in enumerate(ingredients, 1):
+        c_name = (await fetch_one("SELECT name FROM cards WHERE id = ?", (ing['card_id'],)))['name']
+        slot = craft_data[ing['id']]
+        text += f"{idx}. {c_name} (Собрано {slot['filled']}/{slot['req']})\n"
+        
+        for inv_id, count in slot['selected'].items():
+            inv_det = await fetch_one("SELECT mutation FROM inventory WHERE id = ?", (inv_id,))
+            if inv_det:
+                if inv_det['mutation'] == 'Gold': total_gold += count
+                elif inv_det['mutation'] == 'Rainbow': total_rainbow += count
+                
+        if slot['filled'] < slot['req']: all_filled = False
+        
+        row = []
+        if slot['filled'] < slot['req']:
+            row.append(InlineKeyboardButton(text=f"[{idx}] Авто ⚪", callback_data=f"craft_auto_{ing['id']}"))
+            row.append(InlineKeyboardButton(text=f"[{idx}] Выбрать", callback_data=f"craft_pick_{ing['id']}"))
+        if slot['filled'] > 0:
+            row.append(InlineKeyboardButton(text=f"[{idx}] Очистить", callback_data=f"craft_clear_{ing['id']}"))
+        kb_btns.append(row)
+        
+    rainbow_chance = min(100.0, 2.0 + (total_rainbow / total_req) * 50.0 + (total_gold / total_req) * 10.0) if total_req > 0 else 2.0
+    gold_chance = min(100.0, 12.0 + (total_gold / total_req) * 50.0 + (total_rainbow / total_req) * 80.0) if total_req > 0 else 12.0
+    if rainbow_chance + gold_chance > 100.0:
+        gold_chance = 100.0 - rainbow_chance
+        
+    text += f"━━━━━━━━━━━━━━━━━━━━━━━━\nПрогноз мутации:\n⭐ Золотой: {gold_chance:.1f}%\n🌈 Радужный: {rainbow_chance:.1f}%\n"
+    
+    if all_filled:
+        kb_btns.insert(0, [InlineKeyboardButton(text="✅ СКРАФТИТЬ ✅", callback_data="craft_execute")])
+        
+    kb_btns.append([InlineKeyboardButton(text="❓ Как получить?", callback_data=f"craft_sources_{recipe['target_card_id']}")])
+    kb_btns.append([InlineKeyboardButton(text="🔙 К рецептам", callback_data="craft_recipes_list")])
+    
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_btns), target_card['photo_id']
+
+@dp.callback_query(F.data.startswith("craft_rec_"))
+async def cb_craft_rec_select(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    recipe_id = int(callback.data.split("_")[2])
+    text, kb, photo = await render_recipe_ui(callback.from_user.id, recipe_id)
+    try: await callback.message.delete()
+    except: pass
+    await callback.message.answer_photo(photo=photo, caption=text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("craft_sources_"))
+async def cb_craft_sources(callback: types.CallbackQuery):
+    target_id = int(callback.data.split("_")[2])
+    recipe = await fetch_one("SELECT id FROM craft_recipes WHERE target_card_id = ?", (target_id,))
+    ingredients = await fetch_all("SELECT card_id FROM craft_ingredients WHERE recipe_id = ?", (recipe['id'],))
+    
+    text = "🔍 <b>Источники ингредиентов:</b>\n"
+    for ing in ingredients:
+        c_name = (await fetch_one("SELECT name FROM cards WHERE id = ?", (ing['card_id'],)))['name']
+        src = await get_card_sources(ing['card_id'])
+        text += f"\n<b>{c_name}:</b>\n{src}\n"
+        
+    await callback.message.answer(text)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("craft_clear_"))
+async def cb_craft_clear(callback: types.CallbackQuery):
+    ing_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    if user_id in active_crafts and ing_id in active_crafts[user_id]['ingredients']:
+        active_crafts[user_id]['ingredients'][ing_id]['selected'] = {}
+        active_crafts[user_id]['ingredients'][ing_id]['filled'] = 0
+        text, kb, _ = await render_recipe_ui(user_id, active_crafts[user_id]['recipe_id'])
+        await callback.message.edit_caption(caption=text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("craft_auto_"))
+async def cb_craft_auto(callback: types.CallbackQuery):
+    ing_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    if user_id not in active_crafts: return await callback.answer("Ошибка сессии.", show_alert=True)
+    
+    slot = active_crafts[user_id]['ingredients'][ing_id]
+    needed = slot['req'] - slot['filled']
+    if needed <= 0: return await callback.answer()
+    
+    invs = await fetch_all("""
+        SELECT id, count, mutation, serial_number, signed_by 
+        FROM inventory 
+        WHERE user_id = ? AND card_id = ? AND count > 0
+    """, (user_id, slot['card_id']))
+    
+    def sort_key(x):
+        mut_w = 1 if x['mutation'] == 'Normal' else (2 if x['mutation'] == 'Gold' else 3)
+        sgn_w = 1 if x['signed_by'] == 0 else 2
+        ser_w = 1 if x['serial_number'] == 0 else 2
+        return (mut_w, sgn_w, ser_w)
+        
+    invs.sort(key=sort_key)
+    
+    added = 0
+    for item in invs:
+        if needed <= 0: break
+        
+        used_elsewhere = 0
+        for other_ing_id, other_slot in active_crafts[user_id]['ingredients'].items():
+            used_elsewhere += other_slot['selected'].get(item['id'], 0)
+            
+        avail = item['count'] - used_elsewhere
+        if avail <= 0: continue
+        
+        take = min(needed, avail)
+        slot['selected'][item['id']] = slot['selected'].get(item['id'], 0) + take
+        slot['filled'] += take
+        needed -= take
+        added += take
+        
+    if added == 0:
+        await callback.answer("У вас нет подходящих свободных карт!", show_alert=True)
+    else:
+        text, kb, _ = await render_recipe_ui(user_id, active_crafts[user_id]['recipe_id'])
+        await callback.message.edit_caption(caption=text, reply_markup=kb)
+        await callback.answer()
+
+@dp.callback_query(F.data.startswith("craft_pick_"))
+async def cb_craft_pick(callback: types.CallbackQuery):
+    ing_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    if user_id not in active_crafts: return await callback.answer("Ошибка сессии.")
+    
+    slot = active_crafts[user_id]['ingredients'][ing_id]
+    invs = await fetch_all("""
+        SELECT i.id as inv_id, c.name, i.count, i.mutation, i.serial_number, i.signed_by, u.username, u.first_name
+        FROM inventory i JOIN cards c ON i.card_id = c.id LEFT JOIN users u ON i.signed_by = u.id
+        WHERE i.user_id = ? AND i.card_id = ? AND i.count > 0
+    """, (user_id, slot['card_id']))
+    
+    items = []
+    for item in invs:
+        used = sum(s['selected'].get(item['inv_id'], 0) for s in active_crafts[user_id]['ingredients'].values())
+        avail = item['count'] - used
+        if avail > 0:
+            mut_str = "⭐" if item['mutation'] == 'Gold' else "🌈" if item['mutation'] == 'Rainbow' else "⚪"
+            ser = f"[#{item['serial_number']:04d}] " if item['serial_number'] > 0 else ""
+            sgn = "✍️ " if item['signed_by'] > 0 else ""
+            items.append({
+                "id": f"{ing_id}_{item['inv_id']}",
+                "btn_text": f"{mut_str} {ser}{sgn}{item['name']} (x{avail})"
+            })
+            
+    if not items: return await callback.answer("У вас нет свободных копий этой карты!", show_alert=True)
+    
+    kb = get_pagination_keyboard(items, 0, "cr_sel", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Отмена", callback_data=f"cr_back_ui")])
+    await callback.message.edit_caption(caption="👇 Выберите карту для крафта:", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "cr_back_ui")
+async def cb_cr_back_ui(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id in active_crafts:
+        text, kb, _ = await render_recipe_ui(user_id, active_crafts[user_id]['recipe_id'])
+        await callback.message.edit_caption(caption=text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cr_sel_page_"))
+async def cb_cr_sel_pag(callback: types.CallbackQuery):
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cr_sel_"))
+async def cb_cr_sel_item(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    parts = callback.data.split("_")
+    ing_id = int(parts[2])
+    inv_id = int(parts[3])
+    user_id = callback.from_user.id
+    
+    if user_id not in active_crafts: return await callback.answer()
+    slot = active_crafts[user_id]['ingredients'][ing_id]
+    
+    slot['selected'][inv_id] = slot['selected'].get(inv_id, 0) + 1
+    slot['filled'] += 1
+    
+    text, kb, _ = await render_recipe_ui(user_id, active_crafts[user_id]['recipe_id'])
+    await callback.message.edit_caption(caption=text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "craft_execute")
+async def cb_craft_execute(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in active_crafts: return await callback.answer()
+    
+    craft_data = active_crafts[user_id]
+    recipe_id = craft_data['recipe_id']
+    recipe = await fetch_one("SELECT target_card_id, price FROM craft_recipes WHERE id = ?", (recipe_id,))
+    user = await fetch_one("SELECT coins FROM users WHERE id = ?", (user_id,))
+    
+    if user['coins'] < recipe['price']:
+        return await callback.answer("❌ Недостаточно шекелей!", show_alert=True)
+        
+    for ing in craft_data['ingredients'].values():
+        if ing['filled'] < ing['req']:
+            return await callback.answer("❌ Ингредиенты не собраны!", show_alert=True)
+            
+    # ИСПРАВЛЕНИЕ БАГА КРАФТА: Агрегируем нужное количество по уникальному id инвентаря
+    required_invs = {}
+    for ing in craft_data['ingredients'].values():
+        for inv_id, qty in ing['selected'].items():
+            required_invs[inv_id] = required_invs.get(inv_id, 0) + qty
+
+    db = await get_db_connection()
+    try:
+        await db.execute("BEGIN")
+        
+        # 1. Сначала полностью валидируем всё наличие
+        for inv_id, qty in required_invs.items():
+            cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
+            row = await cur.fetchone()
+            if not row or row['count'] < qty: raise Exception("Missing items")
+            
+        # 2. Затем безопасно списываем
+        for inv_id, qty in required_invs.items():
+            cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
+            row = await cur.fetchone()
+            if row['count'] == qty:
+                await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
+                for s in ['equip1', 'equip2', 'equip3', 'equip4']:
+                    await db.execute(f"UPDATE users SET {s} = 0 WHERE id = ? AND {s} = ?", (user_id, inv_id))
+            else:
+                await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, inv_id))
+                
+        await db.execute("UPDATE users SET coins = coins - ? WHERE id = ?", (recipe['price'], user_id))
+        
+        # Вычисление мутации
+        total_req = sum(i['req'] for i in craft_data['ingredients'].values())
+        total_gold = 0
+        total_rainbow = 0
+        for ing in craft_data['ingredients'].values():
+            for inv_id, qty in ing['selected'].items():
+                cur = await db.execute("SELECT mutation FROM inventory WHERE id = ?", (inv_id,))
+                row = await cur.fetchone()
+                if row['mutation'] == 'Gold': total_gold += qty
+                elif row['mutation'] == 'Rainbow': total_rainbow += qty
+                
+        rainbow_chance = 0.02 + (total_rainbow / total_req) * 0.5 + (total_gold / total_req) * 0.1
+        gold_chance = 0.12 + (total_gold / total_req) * 0.5 + (total_rainbow / total_req) * 0.8
+        
+        r = random.random()
+        if r < rainbow_chance: result_mut = "Rainbow"
+        elif r < rainbow_chance + gold_chance: result_mut = "Gold"
+        else: result_mut = "Normal"
+        
+        await db.commit()
+    except Exception as e:
+        await db.execute("ROLLBACK")
+        logging.error(f"Craft Error: {e}")
+        return await callback.answer("❌ Ошибка при проверке предметов. Возможно, вы их обменяли или не хватает копий.", show_alert=True)
+    finally:
+        await db.close()
+        
+    target_card = await fetch_one("SELECT * FROM cards WHERE id = ?", (recipe['target_card_id'],))
+    _, serial, _ = await give_card_to_user(user_id, target_card['id'], result_mut, target_card['rarity'])
+    
+    target_card['mutation'] = result_mut
+    target_card['serial_number'] = serial
+    target_card['signed_by'] = 0
+    
+    await log_user_action(user_id, f"Скрафтил {target_card['name']} (Mut: {result_mut})")
+    active_crafts.pop(user_id, None)
+    
+    mut_str = "🌈 Радужная" if result_mut == 'Rainbow' else ("⭐ Золотая" if result_mut == 'Gold' else "Обычная")
+    text = f"🎉 <b>КРАФТ УСПЕШЕН!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВы создали: {format_card_name(target_card)}\nМутация: <b>{mut_str}</b>\n\nКарта добавлена в инвентарь!"
+    await callback.message.edit_caption(caption=text, reply_markup=None)
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "craft_upgrade_list")
+async def cb_craft_upgrade_list(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    invs = await fetch_all("""
+        SELECT card_id, mutation, SUM(count) as total
+        FROM inventory
+        WHERE user_id = ?
+        GROUP BY card_id, mutation
+        HAVING total >= 8
+    """, (user_id,))
+    
+    if not invs:
+        return await callback.answer("У вас нет 8 одинаковых копий одной мутации для улучшения.", show_alert=True)
+        
+    items = []
+    for r in invs:
+        if r['mutation'] == 'Rainbow': continue
+        
+        c_info = await fetch_one("SELECT name, rarity FROM cards WHERE id = ?", (r['card_id'],))
+        if not c_info: continue
+        
+        from_mut = "⚪" if r['mutation'] == 'Normal' else "⭐"
+        to_mut = "⭐" if r['mutation'] == 'Normal' else "🌈"
+        
+        items.append({
+            "id": f"{r['card_id']}_{r['mutation']}",
+            "btn_text": f"✨ {from_mut} {c_info['name']} ➡️ {to_mut}"
+        })
+        
+    if not items:
+        return await callback.answer("Нет доступных улучшений (Радужные карты нельзя улучшить).", show_alert=True)
+        
+    kb = get_pagination_keyboard(items, 0, "crupgrade", columns=1, items_per_page=8)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="craft_menu_main")])
+    await callback.message.edit_text("✨ <b>ДОСТУПНЫЕ УЛУЧШЕНИЯ</b>\nТребуется 8 карт для слияния.", reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("crupgrade_page_"))
+async def cb_cr_upg_pag(callback: types.CallbackQuery):
+    await cb_craft_upgrade_list(callback) 
+
+@dp.callback_query(F.data.startswith("crupgrade_"))
+async def cb_cr_upg_select(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    parts = callback.data.split("_")
+    card_id = int(parts[1])
+    mutation = parts[2]
+    user_id = callback.from_user.id
+    
+    c_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (card_id,))
+    from_mut = "⚪ Обычная" if mutation == 'Normal' else "⭐ Золотая"
+    to_mut = "⭐ Золотую" if mutation == 'Normal' else "🌈 Радужную"
+    
+    total = (await fetch_one("SELECT SUM(count) as t FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ?", (user_id, card_id, mutation)))['t']
+    
+    active_upgrades[user_id] = {'card_id': card_id, 'mutation': mutation, 'selected': {}}
+    
+    text = f"✨ <b>Улучшение: {c_info['name']}</b>\nИз {from_mut} в {to_mut}.\n\nУ вас есть: {total} шт. Требуется: 8 шт.\nНажмите «Авто-заполнение», чтобы выбрать 8 копий для слияния."
+    
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⚡ Авто-заполнение (8 шт.)", callback_data="crup_auto")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="craft_upgrade_list")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "crup_auto")
+async def cb_crup_auto(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in active_upgrades: return await callback.answer()
+    
+    data = active_upgrades[user_id]
+    invs = await fetch_all("""
+        SELECT id, count, serial_number, signed_by 
+        FROM inventory 
+        WHERE user_id = ? AND card_id = ? AND mutation = ? AND count > 0
+    """, (user_id, data['card_id'], data['mutation']))
+    
+    def sort_key(x):
+        sgn_w = 1 if x['signed_by'] == 0 else 2
+        ser_w = 1 if x['serial_number'] == 0 else 2
+        return (sgn_w, ser_w)
+        
+    invs.sort(key=sort_key)
+    
+    needed = 8
+    selected = {}
+    for item in invs:
+        if needed <= 0: break
+        take = min(needed, item['count'])
+        selected[item['id']] = take
+        needed -= take
+        
+    if needed > 0:
+        return await callback.answer("У вас не хватает карт! (Возможно, они используются в экипировке или трейде).", show_alert=True)
+        
+    data['selected'] = selected
+    
+    c_info = await fetch_one("SELECT name FROM cards WHERE id = ?", (data['card_id'],))
+    text = f"✨ <b>Готово к слиянию: {c_info['name']}</b>\n\nВыбраны копии:\n"
+    for inv_id, qty in selected.items():
+        inv_data = await fetch_one("SELECT serial_number, signed_by FROM inventory WHERE id = ?", (inv_id,))
+        ser = f"[#{inv_data['serial_number']:04d}] " if inv_data['serial_number'] > 0 else ""
+        sgn = "✍️ " if inv_data['signed_by'] > 0 else ""
+        text += f"  └ {ser}{sgn}x{qty}\n"
+        
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ СЛИЯНИЕ", callback_data="crup_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="craft_upgrade_list")]
+    ])
+    await callback.message.edit_text(text, reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(F.data == "crup_confirm")
+async def cb_crup_confirm(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if user_id not in active_upgrades: return await callback.answer()
+    
+    data = active_upgrades[user_id]
+    to_mut = "Gold" if data['mutation'] == 'Normal' else "Rainbow"
+    
+    db = await get_db_connection()
+    try:
+        await db.execute("BEGIN")
+        for inv_id, qty in data['selected'].items():
+            cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
+            row = await cur.fetchone()
+            if not row or row['count'] < qty: raise Exception("Missing items")
+            if row['count'] == qty:
+                await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
+                for s in ['equip1', 'equip2', 'equip3', 'equip4']:
+                    await db.execute(f"UPDATE users SET {s} = 0 WHERE id = ? AND {s} = ?", (user_id, inv_id))
+            else:
+                await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, inv_id))
+        await db.commit()
+    except Exception as e:
+        await db.execute("ROLLBACK")
+        return await callback.answer("Ошибка слияния! Возможно, карты были удалены или использованы.", show_alert=True)
+    finally:
+        await db.close()
+        
+    target_card = await fetch_one("SELECT * FROM cards WHERE id = ?", (data['card_id'],))
+    _, serial, _ = await give_card_to_user(user_id, target_card['id'], to_mut, target_card['rarity'])
+    
+    target_card['mutation'] = to_mut
+    target_card['serial_number'] = serial
+    target_card['signed_by'] = 0
+    
+    await log_user_action(user_id, f"Улучшил {target_card['name']} до {to_mut}")
+    active_upgrades.pop(user_id, None)
+    
+    mut_str = "🌈 Радужная" if to_mut == 'Rainbow' else "⭐ Золотая"
+    text = f"🎉 <b>УЛУЧШЕНИЕ УСПЕШНО!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВы получили: {format_card_name(target_card)}\nНовая Мутация: <b>{mut_str}</b>\n\nКарта добавлена в инвентарь!"
+    await callback.message.edit_text(text, reply_markup=None)
+    await callback.answer()
+
+async def main():
+    await check_and_update_schema()
+    
+    shop_exists = await fetch_all("SELECT * FROM shop_items")
+    if not shop_exists: await restock_shop()
+    
+    settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
+    if settings and settings['last_lb_reward'] == 0:
+        await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (time.time(),))
+    
+    asyncio.create_task(shop_auto_restock_task())
+    asyncio.create_task(leaderboard_rewards_task())
+    asyncio.create_task(trade_timeout_task())
+    asyncio.create_task(auto_backup_db())
+    
+    commands = [
+        BotCommand(command="start", description="Главное меню / Main Menu"),
+        BotCommand(command="getcard", description="Выбить карту / Draw Card"),
+        BotCommand(command="shop", description="Магазин / Shop"),
+        BotCommand(command="inventory", description="Инвентарь / Inventory"),
+        BotCommand(command="equip", description="Экипировка колоды / Equip Deck"),
+        BotCommand(command="craft", description="Мастерская Крафта / Crafting"),
+        BotCommand(command="profile", description="Профиль и статы / Profile & Stats"),
+        BotCommand(command="trade", description="Обменяться картами / Trade Cards"),
+        BotCommand(command="quests", description="Квесты / Quests"),
+        BotCommand(command="index", description="Индекс всех карт / Card Index"),
+        BotCommand(command="top", description="Рейтинг игроков / Leaderboard"),
+        BotCommand(command="codereward", description="Активировать код / Redeem Code")
+    ]
+    await bot.set_my_commands(commands)
+    
+    logging.info("🤖 Карточный бот успешно перезапущен (Крафты, Мутации, Баги боя)!")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
