@@ -276,6 +276,19 @@ async def check_and_update_schema():
                 reward_mult REAL DEFAULT 1.0
             )
         """)
+
+        await db.execute("DELETE FROM ranks")
+        default_ranks = [
+            ("🟤 Bronze I", 0, 0.8, 1.0), ("🟤 Bronze II", 50, 0.85, 1.05), ("🟤 Bronze III", 100, 0.9, 1.1), ("🟤 Bronze IV", 150, 0.95, 1.15),
+            ("⚪ Silver I", 200, 1.0, 1.2), ("⚪ Silver II", 300, 1.05, 1.25), ("⚪ Silver III", 400, 1.1, 1.3), ("⚪ Silver IV", 500, 1.15, 1.35),
+            ("🟡 Gold I", 650, 1.2, 1.4), ("🟡 Gold II", 800, 1.3, 1.5), ("🟡 Gold III", 950, 1.4, 1.6), ("🟡 Gold IV", 1100, 1.5, 1.7),
+            ("🟢 Platina I", 1300, 1.8, 1.8), ("🟢 Platina II", 1500, 2.5, 1.9), ("🟢 Platina III", 1700, 3.2, 2.0), ("🟢 Platina IV", 1900, 4.0, 2.1),
+            ("💎 Diamond I", 2200, 5.0, 2.5), ("💎 Diamond II", 2500, 6.5, 2.8), ("💎 Diamond III", 2800, 8.0, 3.2), ("💎 Diamond IV", 3100, 10.0, 3.6),
+            ("🔴 Ruby I", 3500, 13.0, 4.0), ("🔴 Ruby II", 4000, 15.0, 4.5), ("🔴 Ruby III", 4500, 17.0, 5.0), ("🔴 Ruby IV", 5000, 20.0, 5.5),
+            ("☢️ Uranium I", 5700, 24.0, 6.0), ("☢️ Uranium II", 6500, 28.0, 6.5), ("☢️ Uranium III", 7400, 32.0, 7.0), ("☢️ Uranium IV", 8400, 36.0, 7.5), ("☢️ Uranium V", 9500, 40.0, 8.0)
+        ]
+        for r in default_ranks:
+            await db.execute("INSERT INTO ranks (name, min_trophies, difficulty_mult, reward_mult) VALUES (?, ?, ?, ?)", r)
         
         await db.execute("""
             CREATE TABLE IF NOT EXISTS server_settings (
@@ -345,8 +358,11 @@ async def check_and_update_schema():
 
         await db.execute("""CREATE TABLE IF NOT EXISTS admin_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER, action TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS admins (user_id INTEGER PRIMARY KEY)""")
-        await db.execute("""CREATE TABLE IF NOT EXISTS lb_rewards (id INTEGER PRIMARY KEY AUTOINCREMENT, bracket TEXT, reward_type TEXT, amount INTEGER DEFAULT 0, card_id INTEGER DEFAULT 0, mutation TEXT DEFAULT 'Normal')""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS lb_rewards (id INTEGER PRIMARY KEY AUTOINCREMENT, bracket TEXT, reward_type TEXT, amount INTEGER DEFAULT 0, card_id INTEGER DEFAULT 0, mutation TEXT DEFAULT 'Normal', lb_type TEXT DEFAULT 'trophies')""")
         
+        try: await db.execute("ALTER TABLE lb_rewards ADD COLUMN lb_type TEXT DEFAULT 'trophies'")
+        except aiosqlite.OperationalError: pass
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS authorized_signers (
                 user_id INTEGER PRIMARY KEY
@@ -429,21 +445,6 @@ async def check_and_update_schema():
 
         await db.execute("INSERT OR IGNORE INTO admins (user_id) VALUES (?)", (SUPER_ADMIN_ID,))
         await db.execute("INSERT OR IGNORE INTO server_settings (id) VALUES (1)")
-        
-        async with db.execute("SELECT COUNT(*) as c FROM ranks") as cursor:
-            row = await cursor.fetchone()
-            if row and row['c'] == 0:
-                default_ranks = [
-                    ("Bronze I", 0, 0.8, 1.0), ("Bronze II", 50, 0.85, 1.05), ("Bronze III", 100, 0.9, 1.1), ("Bronze IV", 150, 0.95, 1.15),
-                    ("Silver I", 200, 1.0, 1.2), ("Silver II", 300, 1.05, 1.25), ("Silver III", 400, 1.1, 1.3), ("Silver IV", 500, 1.15, 1.35),
-                    ("Gold I", 650, 1.2, 1.4), ("Gold II", 800, 1.3, 1.5), ("Gold III", 950, 1.4, 1.6), ("Gold IV", 1100, 1.5, 1.7),
-                    ("Platina I", 1300, 1.8, 1.8), ("Platina II", 1500, 2.5, 1.9), ("Platina III", 1700, 3.2, 2.0), ("Platina IV", 1900, 4.0, 2.1),
-                    ("Diamond I", 2200, 5.0, 2.5), ("Diamond II", 2500, 6.5, 2.8), ("Diamond III", 2800, 8.0, 3.2), ("Diamond IV", 3100, 10.0, 3.6),
-                    ("Ruby I", 3500, 13.0, 4.0), ("Ruby II", 4000, 15.0, 4.5), ("Ruby III", 4500, 17.0, 5.0), ("Ruby IV", 5000, 20.0, 5.5), ("Ruby V", 5600, 24.0, 6.0)
-                ]
-                for r in default_ranks:
-                    await db.execute("INSERT INTO ranks (name, min_trophies, difficulty_mult, reward_mult) VALUES (?, ?, ?, ?)", r)
-
         await db.commit()
     finally:
         await db.close()
@@ -576,6 +577,12 @@ class AdminCraftCreate(StatesGroup):
     price = State()
     add_ingredient_card = State()
     add_ingredient_amount = State()
+
+class AdminCraftEdit(StatesGroup):
+    menu = State()
+    edit_price = State()
+    add_ing_card = State()
+    add_ing_amount = State()
 
 # ========================================================================
 # УТИЛИТЫ И ХЕЛПЕРЫ ДЛЯ UI
@@ -722,7 +729,7 @@ async def get_user_rank(trophies: int):
             res = dict(r)
             res['rank_idx'] = len(ranks) - idx - 1
             return res
-    return {"name": "Bronze I", "difficulty_mult": 0.8, "reward_mult": 1.0, "rank_idx": 0}
+    return {"name": "🟤 Bronze I", "difficulty_mult": 0.8, "reward_mult": 1.0, "rank_idx": 0}
 
 async def get_active_events():
     settings = await fetch_one("SELECT * FROM server_settings WHERE id = 1")
@@ -756,8 +763,7 @@ def get_mutation_multiplier(mutation: str) -> float:
     return 1.0
 
 def needs_serial_number(rarity: str, mutation: str) -> bool:
-    if rarity == 'Leaderboard': return True
-    if rarity in ['Mythic', 'Super']: return True
+    if rarity in ['Leaderboard', 'Exclusive', 'Mythic', 'Super']: return True
     if rarity == 'Legendary' and mutation in ['Gold', 'Rainbow']: return True
     return False
 
@@ -913,6 +919,9 @@ async def get_card_sources(card_id: int) -> str:
     if bps:
         sources.append("🎟 Батл-Пасс: " + ", ".join(list(set([b['title'] for b in bps]))))
         
+    craft = await fetch_one("SELECT id FROM craft_recipes WHERE target_card_id = ?", (card_id,))
+    if craft: sources.append("🔨 Мастерская Крафта")
+
     if not sources:
         return "Невозможно получить (Эксклюзив)"
     return "\n".join(f"  └ {s}" for s in sources)
@@ -1031,41 +1040,60 @@ async def leaderboard_rewards_task():
             settings = await fetch_one("SELECT last_lb_reward FROM server_settings WHERE id = 1")
             now = time.time()
             if settings and (now - settings['last_lb_reward'] >= 2 * 24 * 3600):
-                top_users = await fetch_all("SELECT id, lang, trophies, username, first_name FROM users ORDER BY trophies DESC LIMIT 20")
-                if top_users:
-                    for idx, user in enumerate(top_users):
-                        pos = idx + 1
-                        if pos == 1: bracket = "1"
-                        elif pos == 2: bracket = "2"
-                        elif pos == 3: bracket = "3"
-                        elif pos <= 9: bracket = "4_9"
-                        else: bracket = "10_20"
-                        
-                        rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ?", (bracket,))
-                        reward_msgs_ru = []
-                        reward_msgs_en = []
-                        for r in rewards:
-                            if r['reward_type'] == 'shekels':
-                                await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (r['amount'], user['id']))
-                                reward_msgs_ru.append(f"💰 {r['amount']} Шекелей")
-                                reward_msgs_en.append(f"💰 {r['amount']} Shekels")
-                            elif r['reward_type'] == 'card':
-                                c_info = await fetch_one("SELECT name, rarity FROM cards WHERE id = ?", (r['card_id'],))
-                                if c_info:
-                                    _, serial, _ = await give_card_to_user(user['id'], r['card_id'], r['mutation'], c_info['rarity'])
-                                    mut_str = "🌈" if r['mutation'] == 'Rainbow' else ("⭐" if r['mutation'] == 'Gold' else "")
-                                    s_str = f" [#{serial:04d}]" if serial > 0 else ""
-                                    reward_msgs_ru.append(f"🃏 {mut_str} {c_info['name']}{s_str}")
-                                    reward_msgs_en.append(f"🃏 {mut_str} {c_info['name']}{s_str}")
-                                    
-                        if rewards:
-                            msg_text = loc(user['lang'],
-                                f"🏆 <b>ГРАНДИОЗНАЯ НАГРАДА ЗА ТОП ИГРОКОВ!</b> 🏆\n\nПоздравляем! Вы заняли <b>{pos} место</b> в мире!\n\n🎁 <b>Награда:</b>\n" + "\n".join([f"🔸 {m}" for m in reward_msgs_ru]) + "\n\n<i>Рейтинг сброшен. Удачи!</i>",
-                                f"🏆 <b>LEADERBOARD GRAND REWARD!</b> 🏆\n\nCongratulations! You placed <b>#{pos}</b> in the world!\n\n🎁 <b>Reward:</b>\n" + "\n".join([f"🔸 {m}" for m in reward_msgs_en]) + "\n\n<i>Leaderboard reset. Good luck!</i>"
-                            )
-                            try: await bot.send_message(user['id'], msg_text)
-                            except: pass
+                
+                for lb_type in ['trophies', 'coins', 'cards']:
+                    if lb_type == 'trophies':
+                        top_users = await fetch_all("SELECT id, lang, trophies as score, username, first_name FROM users WHERE id != ? ORDER BY trophies DESC LIMIT 20", (SUPER_ADMIN_ID,))
+                    elif lb_type == 'coins':
+                        top_users = await fetch_all("SELECT id, lang, coins as score, username, first_name FROM users WHERE id != ? ORDER BY coins DESC LIMIT 20", (SUPER_ADMIN_ID,))
+                    else:
+                        top_users = await fetch_all("""
+                            SELECT u.id, u.lang, SUM(i.count) as score, u.username, u.first_name 
+                            FROM users u JOIN inventory i ON u.id = i.user_id 
+                            WHERE u.id != ? GROUP BY u.id ORDER BY score DESC LIMIT 20
+                        """, (SUPER_ADMIN_ID,))
+
+                    if top_users:
+                        for idx, user in enumerate(top_users):
+                            pos = idx + 1
+                            if pos == 1: bracket = "1"
+                            elif pos == 2: bracket = "2"
+                            elif pos == 3: bracket = "3"
+                            elif pos <= 9: bracket = "4_9"
+                            else: bracket = "10_20"
                             
+                            rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ? AND lb_type = ?", (bracket, lb_type))
+                            reward_msgs_ru = []
+                            reward_msgs_en = []
+                            for r in rewards:
+                                if r['reward_type'] == 'shekels':
+                                    await execute_db("UPDATE users SET coins = coins + ? WHERE id = ?", (r['amount'], user['id']))
+                                    reward_msgs_ru.append(f"💰 {r['amount']} Шекелей")
+                                    reward_msgs_en.append(f"💰 {r['amount']} Shekels")
+                                elif r['reward_type'] == 'card':
+                                    c_info = await fetch_one("SELECT name, rarity FROM cards WHERE id = ?", (r['card_id'],))
+                                    if c_info:
+                                        _, serial, _ = await give_card_to_user(user['id'], r['card_id'], r['mutation'], c_info['rarity'])
+                                        mut_str = "🌈" if r['mutation'] == 'Rainbow' else ("⭐" if r['mutation'] == 'Gold' else "")
+                                        s_str = f" [#{serial:04d}]" if serial > 0 else ""
+                                        reward_msgs_ru.append(f"🃏 {mut_str} {c_info['name']}{s_str}")
+                                        reward_msgs_en.append(f"🃏 {mut_str} {c_info['name']}{s_str}")
+                                        
+                            if rewards:
+                                lb_name_ru = "Кубки (Сезон)" if lb_type == 'trophies' else ("Шекели (Все время)" if lb_type == 'coins' else "Карты (Все время)")
+                                lb_name_en = "Trophies (Season)" if lb_type == 'trophies' else ("Shekels (All time)" if lb_type == 'coins' else "Cards (All time)")
+                                
+                                reset_str_ru = "\n\n<i>Рейтинг сброшен. Удачи!</i>" if lb_type == 'trophies' else ""
+                                reset_str_en = "\n\n<i>Leaderboard reset. Good luck!</i>" if lb_type == 'trophies' else ""
+                                
+                                msg_text = loc(user['lang'],
+                                    f"🏆 <b>ГРАНДИОЗНАЯ НАГРАДА ЗА ТОП ИГРОКОВ ({lb_name_ru})!</b> 🏆\n\nПоздравляем! Вы заняли <b>{pos} место</b> в мире!\n\n🎁 <b>Награда:</b>\n" + "\n".join([f"🔸 {m}" for m in reward_msgs_ru]) + reset_str_ru,
+                                    f"🏆 <b>LEADERBOARD GRAND REWARD ({lb_name_en})!</b> 🏆\n\nCongratulations! You placed <b>#{pos}</b> in the world!\n\n🎁 <b>Reward:</b>\n" + "\n".join([f"🔸 {m}" for m in reward_msgs_en]) + reset_str_en
+                                )
+                                try: await bot.send_message(user['id'], msg_text)
+                                except: pass
+                
+                await execute_db("UPDATE users SET trophies = 0")
                 await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (now,))
         except Exception as e:
             logging.error(f"LB Rewards error: {e}")
@@ -1404,24 +1432,59 @@ async def cmd_top(message: types.Message):
     if await check_ban(message.from_user.id): return
     user = await fetch_one("SELECT lang FROM users WHERE id=?", (message.from_user.id,))
     lang = user['lang'] if user else "ru"
-    top_users = await fetch_all("SELECT username, first_name, id, trophies FROM users ORDER BY trophies DESC LIMIT 20")
     
-    text = loc(lang, "🏆 <b>МИРОВОЙ РЕЙТИНГ (Топ-20)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n", "🏆 <b>WORLD LEADERBOARD (Top-20)</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=loc(lang, "🏆 Кубки (Сезон)", "🏆 Trophies (Season)"), callback_data="top_trophies")],
+        [InlineKeyboardButton(text=loc(lang, "💰 Монеты (Все время)", "💰 Coins (All time)"), callback_data="top_coins")],
+        [InlineKeyboardButton(text=loc(lang, "🃏 Карты (Все время)", "🃏 Cards (All time)"), callback_data="top_cards")]
+    ])
+    
+    await message.answer(loc(lang, "🏆 <b>МИРОВЫЕ РЕЙТИНГИ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите категорию лидерборда:", "🏆 <b>WORLD LEADERBOARDS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nChoose leaderboard category:"), reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("top_"))
+async def cb_top_view(callback: types.CallbackQuery):
+    lb_type = callback.data.split("_")[1]
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (callback.from_user.id,))
+    lang = user['lang'] if user else "ru"
+    
+    if lb_type == 'trophies':
+        top_users = await fetch_all("SELECT username, first_name, id, trophies as score FROM users WHERE id != ? ORDER BY trophies DESC LIMIT 20", (SUPER_ADMIN_ID,))
+        title_ru = "🏆 <b>МИРОВОЙ РЕЙТИНГ: КУБКИ (Топ-20)</b>"
+        title_en = "🏆 <b>WORLD LEADERBOARD: TROPHIES (Top-20)</b>"
+        unit = "🏆"
+    elif lb_type == 'coins':
+        top_users = await fetch_all("SELECT username, first_name, id, coins as score FROM users WHERE id != ? ORDER BY coins DESC LIMIT 20", (SUPER_ADMIN_ID,))
+        title_ru = "💰 <b>МИРОВОЙ РЕЙТИНГ: ШЕКЕЛИ (Топ-20)</b>"
+        title_en = "💰 <b>WORLD LEADERBOARD: SHEKELS (Top-20)</b>"
+        unit = "💰"
+    else:
+        top_users = await fetch_all("SELECT u.id, u.username, u.first_name, SUM(i.count) as score FROM users u JOIN inventory i ON u.id = i.user_id WHERE u.id != ? GROUP BY u.id ORDER BY score DESC LIMIT 20", (SUPER_ADMIN_ID,))
+        title_ru = "🃏 <b>МИРОВОЙ РЕЙТИНГ: КАРТЫ (Топ-20)</b>"
+        title_en = "🃏 <b>WORLD LEADERBOARD: CARDS (Top-20)</b>"
+        unit = "🃏"
+
+    text = loc(lang, f"{title_ru}\n━━━━━━━━━━━━━━━━━━━━━━━━\n", f"{title_en}\n━━━━━━━━━━━━━━━━━━━━━━━━\n")
     for i, u in enumerate(top_users, 1):
         name = get_display_name(u)
         title_str = await get_user_titles_str(u['id'], lang)
-        rank = await get_user_rank(u['trophies'])
-        med = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🏅"
-        text += f"{med} <b>{i}. {name}</b>{title_str} — {u['trophies']} 🏆 <i>({rank['name']})</i>\n"
         
-    text += loc(lang, "\n🎁 <b>Награды Сезона (сброс каждые 2 дня):</b>\n", "\n🎁 <b>Season Rewards (resets every 2 days):</b>\n")
+        score_val = u['score'] if u['score'] is not None else 0
+        med = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else "🏅"
+        
+        if lb_type == 'trophies':
+            rank = await get_user_rank(score_val)
+            text += f"{med} <b>{i}. {name}</b>{title_str} — {score_val} {unit} <i>({rank['name']})</i>\n"
+        else:
+            text += f"{med} <b>{i}. {name}</b>{title_str} — {score_val} {unit}\n"
+        
+    text += loc(lang, "\n🎁 <b>Награды (выдаются каждые 2 дня):</b>\n", "\n🎁 <b>Rewards (given every 2 days):</b>\n")
     brackets = ["1", "2", "3", "4_9", "10_20"]
     b_names = loc(lang, {"1": "🥇 1 место", "2": "🥈 2 место", "3": "🥉 3 место", "4_9": "🏅 4-9 места", "10_20": "🎖 10-20 места"},
                         {"1": "🥇 1st place", "2": "🥈 2nd place", "3": "🥉 3rd place", "4_9": "🏅 4-9 places", "10_20": "🎖 10-20 places"})
     
     has_rewards = False
     for b in brackets:
-        b_rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ?", (b,))
+        b_rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ? AND lb_type = ?", (b, lb_type))
         if b_rewards:
             has_rewards = True
             r_strs = []
@@ -1437,7 +1500,26 @@ async def cmd_top(message: types.Message):
     if not has_rewards:
         text += loc(lang, "<i>Награды пока не настроены.</i>", "<i>Rewards not set yet.</i>")
         
-    await message.answer(text)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=loc(lang, "🔙 К выбору", "🔙 Back"), callback_data="top_menu")]
+    ])
+    
+    try: await callback.message.edit_text(text, reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "top_menu")
+async def cb_top_menu(callback: types.CallbackQuery):
+    user = await fetch_one("SELECT lang FROM users WHERE id=?", (callback.from_user.id,))
+    lang = user['lang'] if user else "ru"
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=loc(lang, "🏆 Кубки (Сезон)", "🏆 Trophies (Season)"), callback_data="top_trophies")],
+        [InlineKeyboardButton(text=loc(lang, "💰 Монеты (Все время)", "💰 Coins (All time)"), callback_data="top_coins")],
+        [InlineKeyboardButton(text=loc(lang, "🃏 Карты (Все время)", "🃏 Cards (All time)"), callback_data="top_cards")]
+    ])
+    try: await callback.message.edit_text(loc(lang, "🏆 <b>МИРОВЫЕ РЕЙТИНГИ</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите категорию лидерборда:", "🏆 <b>WORLD LEADERBOARDS</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nChoose leaderboard category:"), reply_markup=kb)
+    except: pass
+    await callback.answer()
 
 @dp.message(Command("shop"))
 @dp.message(F.text.in_(BTN_SHOP))
@@ -2276,32 +2358,41 @@ async def get_bot_team(user_id: int, difficulty_mult: float, rank_name: str, dif
     for c in all_cards:
         by_rarity.setdefault(c['rarity'], []).append(c)
         
-    base_rank = rank_name.split()[0]
+    parts = rank_name.split()
+    base_rank = parts[1] if len(parts) > 1 else "Bronze"
+    
+    ranks_order = ["Bronze", "Silver", "Gold", "Platina", "Diamond", "Ruby", "Uranium"]
+    rank_idx = ranks_order.index(base_rank) if base_rank in ranks_order else 0
+
+    if diff_type == "easy": effective_idx = max(0, rank_idx - 1)
+    elif diff_type == "med": effective_idx = rank_idx
+    elif diff_type == "hard": effective_idx = min(len(ranks_order)-1, rank_idx + 1)
+    elif diff_type == "nightmare": effective_idx = min(len(ranks_order)-1, rank_idx + 2)
+    else: effective_idx = rank_idx
+
+    effective_rank = ranks_order[effective_idx]
     team_selection = []
     
     for _ in range(4):
         r = random.random()
         pool = []
-        if diff_type == "nightmare":
-            if base_rank == "Bronze": pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', []) + (by_rarity.get('Epic', []) if r < 0.2 else [])
-            elif base_rank == "Silver": pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', []) + (by_rarity.get('Legendary', []) if r < 0.2 else [])
-            elif base_rank == "Gold": pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.2 else [])
-            elif base_rank == "Platina": pool = by_rarity.get('Legendary', []) + by_rarity.get('Mythic', []) + (by_rarity.get('Super', []) + by_rarity.get('Leaderboard', []) if r < 0.3 else [])
-            elif base_rank == "Diamond": pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', []) + by_rarity.get('Leaderboard', [])
-            elif base_rank == "Ruby": pool = by_rarity.get('Super', []) + by_rarity.get('Leaderboard', []) + (by_rarity.get('Mythic', []) if r < 0.1 else [])
-        else:
-            if base_rank == "Bronze":
-                pool = by_rarity.get('Basic', []) + by_rarity.get('Uncommon', [])
-            elif base_rank == "Silver":
-                pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', [])
-            elif base_rank == "Gold":
-                pool = by_rarity.get('Rare', []) + (by_rarity.get('Epic', []) if r < 0.3 else [])
-            elif base_rank == "Platina":
-                pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', []) + (by_rarity.get('Legendary', []) if r < 0.1 else [])
-            elif base_rank == "Diamond":
-                pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.05 else [])
-            elif base_rank == "Ruby":
-                pool = by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.2 else []) + (by_rarity.get('Super', []) if r < 0.02 else [])
+        if effective_rank == "Bronze":
+            pool = by_rarity.get('Basic', []) + by_rarity.get('Uncommon', [])
+        elif effective_rank == "Silver":
+            pool = by_rarity.get('Uncommon', []) + by_rarity.get('Rare', []) + (by_rarity.get('Epic', []) if r < 0.1 else [])
+        elif effective_rank == "Gold":
+            pool = by_rarity.get('Rare', []) + by_rarity.get('Epic', []) + (by_rarity.get('Legendary', []) if r < 0.1 else [])
+        elif effective_rank == "Platina":
+            pool = by_rarity.get('Epic', []) + by_rarity.get('Legendary', []) + (by_rarity.get('Mythic', []) if r < 0.1 else [])
+        elif effective_rank == "Diamond":
+            pool = by_rarity.get('Legendary', []) + by_rarity.get('Mythic', []) + (by_rarity.get('Super', []) if r < 0.1 else [])
+        elif effective_rank == "Ruby":
+            pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + (by_rarity.get('Leaderboard', []) if r < 0.1 else [])
+        elif effective_rank == "Uranium":
+            if diff_type == "nightmare":
+                pool = by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + by_rarity.get('Leaderboard', [])
+            else:
+                pool = by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + by_rarity.get('Mythic', []) + by_rarity.get('Leaderboard', [])
         
         if not pool:
             pool = [c for c in all_cards if c['rarity'] != 'Leaderboard']
@@ -2660,16 +2751,6 @@ async def do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, 
 
 # -----------------------------
 # КНОПКА СДАТЬСЯ
-@dp.callback_query(F.data == "surrender_battle")
-async def cb_surrender_battle(callback: types.CallbackQuery):
-    if callback.from_user.id in active_combats:
-        surrendered_players.add(callback.from_user.id)
-        chat_id = callback.message.chat.id
-        if chat_id in active_manual_battles and active_manual_battles[chat_id]['p1_id'] == callback.from_user.id:
-            active_manual_battles[chat_id]['event'].set()
-        await callback.answer("🏳️ Вы сдались!", show_alert=True)
-    else:
-        await callback.answer("Вы не в бою!", show_alert=True)
 
 def get_battle_kb(lang="ru"):
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -2683,220 +2764,6 @@ async def battle_delay(*p_ids, delay=3.0):
         await asyncio.sleep(0.1)
         if any(pid in surrendered_players for pid in p_ids if pid):
             break
-
-async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
-    try:
-        msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
-        await asyncio.sleep(1)
-        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
-        except: pass
-        await asyncio.sleep(1)
-        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 1 сек!", "⚔️ Battle starts in 1s!"))
-        except: pass
-        
-        battle_start_time = time.time()
-        log = []
-        apply_boosters(t1, p1_name, log, None, lang, lang)
-        apply_boosters(t2, p2_name, log, None, lang, lang)
-        
-        if log:
-            try:
-                await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-            except Exception: pass
-            await battle_delay(p1_id, p2_id)
-
-        turn = 1
-        winner = None
-        winner_id = None
-        loser_id = None
-        p1_total_heals = 0
-        p2_total_heals = 0
-        timeout_flag = False
-        
-        while True:
-            if time.time() - battle_start_time > 180:
-                timeout_flag = True
-                break
-                
-            if p1_id in surrendered_players:
-                winner = p2_name; winner_id = p2_id; loser_id = p1_id
-                surrendered_players.discard(p1_id)
-                log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                break
-
-            t1_alive = [c for c in t1 if c['hp'] > 0]
-            t2_alive = [c for c in t2 if c['hp'] > 0]
-            
-            if not t1_alive and not t2_alive:
-                winner = loc(lang, "Ничья", "Draw"); break
-            elif not t1_alive:
-                winner = p2_name; winner_id = p2_id; loser_id = p1_id; break
-            elif not t2_alive:
-                winner = p1_name; winner_id = p1_id; loser_id = p2_id; break
-                
-            if turn > 40:
-                winner = loc(lang, "Ничья по раундам", "Timeout Draw"); break
-
-            did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-            p1_total_heals += heals
-            if did_turn:
-                if len(log) > 6: log = log[-6:]
-                try:
-                    await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                except Exception as e:
-                    if "not found" in str(e).lower() or "deleted" in str(e).lower():
-                        timeout_flag = True; break
-                await battle_delay(p1_id, p2_id)
-
-            if mods and mods.get('mod_enemy_atk_all') and not is_pvp:
-                t1_a = [c for c in t1 if c['hp']>0]
-                t2_a = [c for c in t2 if c['hp']>0]
-                if t1_a and t2_a:
-                    did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-                    p2_total_heals += heals_e
-                    if did_turn_e:
-                        if len(log) > 6: log = log[-6:]
-                        try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                        except Exception as e:
-                            if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                        await battle_delay(p1_id, p2_id)
-
-            t2_alive = [c for c in t2 if c['hp'] > 0]
-            if t2_alive:
-                if time.time() - battle_start_time > 180:
-                    timeout_flag = True
-                    break
-
-                did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-                p2_total_heals += heals_e
-                if did_turn_e:
-                    if len(log) > 6: log = log[-6:]
-                    try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                    except Exception as e:
-                        if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                    await battle_delay(p1_id, p2_id)
-                    
-                if mods and mods.get('mod_player_atk_all') and not is_pvp:
-                    t1_a = [c for c in t1 if c['hp']>0]
-                    t2_a = [c for c in t2 if c['hp']>0]
-                    if t1_a and t2_a:
-                        did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-                        p1_total_heals += heals
-                        if did_turn:
-                            if len(log) > 6: log = log[-6:]
-                            try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                            except Exception as e:
-                                if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                            await battle_delay(p1_id, p2_id)
-            turn += 1
-
-        if timeout_flag:
-            try: await msg.edit_text(loc(lang, "⏳ <b>Бой автоматически прерван (ошибка или тайм-аут)!</b>", "⏳ <b>Battle automatically terminated (timeout/error)!</b>"))
-            except: pass
-            return
-
-        try:
-            if p1_total_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_total_heals)
-            
-            if is_pvp:
-                await add_quest_progress(p1_id, 'q_pvp_played', 1)
-                if p2_id != 0: 
-                    await add_quest_progress(p2_id, 'q_pvp_played', 1)
-                    if p2_total_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_total_heals)
-            else:
-                await add_quest_progress(p1_id, 'q_battles', 1)
-                if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
-
-            code_text = ""
-            winner_user_id = None
-            if winner == p1_name: winner_user_id = p1_id
-            elif is_pvp and winner == p2_name: winner_user_id = p2_id
-
-            if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-                if random.random() <= 0.04:
-                    db = await get_db_connection()
-                    try:
-                        async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                            row = await cursor.fetchone()
-                            if row:
-                                code_val = row['code']
-                                await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                                await db.commit()
-                                code_text = loc(lang,
-                                    f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n",
-                                    f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                                )
-                    except: pass
-                    finally: await db.close()
-
-            final_text = code_text + loc(lang, f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Победитель: {winner}</b>\n\n", f"🏁 <b>BATTLE RESULTS: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Winner: {winner}</b>\n\n")
-            bp_messages = []
-            
-            if pvp_no_rewards:
-                final_text += loc(lang, "🤝 <b>Дружеская дуэль завершена!</b> Награды и кубки не начислялись.", "🤝 <b>Friendly duel finished!</b> No rewards or trophies.")
-            elif is_pvp:
-                if "Draw" not in winner and "Ничья" not in winner and winner_id and loser_id:
-                    await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
-                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
-                    final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
-            else:
-                mod_reward_mult = 1.0; mod_trophy_mult = 1.0
-                if mods:
-                    if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
-                    if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
-                    if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
-                    if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
-                    if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
-                    if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
-                    
-                mod_reward_mult = max(0.1, mod_reward_mult)
-                coin_mult, xp_mult_event = await get_coin_xp_events()
-                
-                if winner == p1_name:
-                    user = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
-                    rank = await get_user_rank(user['trophies'])
-                    
-                    coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
-                    coins_won = int(coins_base * mod_reward_mult)
-                    won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
-                    won_t = int(won_t_base * mod_trophy_mult)
-                    
-                    await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
-                    
-                    final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
-                    if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
-                    if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
-                    final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
-                    
-                    bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-                    final_text += f"🎫 +{bp_xp} BP XP"
-                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-                    
-                elif winner == p2_name:
-                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
-                    final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
-                    bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-                    final_text += f"🎫 +{bp_xp} BP XP"
-                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-                    
-            try: await msg.edit_text(final_text, reply_markup=None)
-            except Exception: pass
-            
-            for b_msg in bp_messages:
-                try: await bot.send_message(p1_id, b_msg)
-                except: pass
-
-        except Exception as e:
-            logging.error(f"Reward error: {e}")
-            try: await msg.edit_text("Ошибка при выдаче наград.", reply_markup=None)
-            except: pass
-
-    finally:
-        active_combats.discard(p1_id)
-        if is_pvp and p2_id != 0: active_combats.discard(p2_id)
-        if chat_id in active_manual_battles: active_manual_battles.pop(chat_id, None)
 
 @dp.message(F.text.in_(BTN_PVE))
 async def cmd_pve_select(message: types.Message):
@@ -3127,159 +2994,6 @@ async def callback_pvp_decline(callback: types.CallbackQuery):
     try: await callback.message.edit_text("❌ Declined.")
     except: pass
     await callback.answer()
-
-async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: str, t1: list, t2: list):
-    try:
-        p1_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p1_id,)))['lang']
-        p2_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p2_id,)))['lang']
-        
-        msg1 = await bot.send_message(p1_id, loc(p1_lang, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p2_name}</b> in 3s!"))
-        msg2 = await bot.send_message(p2_id, loc(p2_lang, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p1_name}</b> in 3s!"))
-        await asyncio.sleep(1)
-        try: await msg1.edit_text("2...")
-        except: pass
-        try: await msg2.edit_text("2...")
-        except: pass
-        await asyncio.sleep(1)
-        try: await msg1.edit_text("1...")
-        except: pass
-        try: await msg2.edit_text("1...")
-        except: pass
-        await asyncio.sleep(1)
-        
-        battle_start_time = time.time()
-        log1 = []
-        log2 = []
-        apply_boosters(t1, p1_name, log1, log2, p1_lang, p2_lang)
-        apply_boosters(t2, p2_name, log1, log2, p1_lang, p2_lang)
-        
-        if log1:
-            header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
-            header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
-            try: await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
-            except: pass
-            try: await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
-            except: pass
-            await battle_delay(p1_id, p2_id)
-
-        turn = 1
-        winner = None
-        p1_heals = p2_heals = 0
-        timeout_flag = False
-        
-        while True:
-            if time.time() - battle_start_time > 180:
-                timeout_flag = True
-                break
-                
-            if p1_id in surrendered_players and p2_id in surrendered_players:
-                winner = "Draw"
-                surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
-                break
-            elif p1_id in surrendered_players:
-                winner = p2_name; surrendered_players.discard(p1_id)
-                log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                break
-            elif p2_id in surrendered_players:
-                winner = p1_name
-                surrendered_players.discard(p2_id)
-                log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-                log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-                break
-
-            t1_a = [c for c in t1 if c['hp'] > 0]
-            t2_a = [c for c in t2 if c['hp'] > 0]
-            if not t1_a and not t2_a: winner = "Draw"; break
-            elif not t1_a: winner = p2_name; break
-            elif not t2_a: winner = p1_name; break
-            if turn > 40: winner = "Timeout Draw"; break
-
-            did_turn, h = await execute_turn(t1, t2, p1_name, p2_name, log1, log2, p1_lang, p2_lang)
-            p1_heals += h
-            if did_turn:
-                if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-                try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                await battle_delay(p1_id, p2_id)
-
-            t2_a = [c for c in t2 if c['hp'] > 0]
-            if t2_a:
-                if time.time() - battle_start_time > 180:
-                    timeout_flag = True
-                    break
-                    
-                did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
-                p2_heals += h
-                if did_turn:
-                    if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-                    try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
-                    except Exception as e:
-                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                    try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
-                    except Exception as e:
-                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                    await battle_delay(p1_id, p2_id)
-            turn += 1
-
-        if timeout_flag:
-            txt1 = loc(p1_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
-            txt2 = loc(p2_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
-            try: await msg1.edit_text(txt1)
-            except: pass
-            try: await msg2.edit_text(txt2)
-            except: pass
-            return
-
-        await add_quest_progress(p1_id, 'q_pvp_played', 1)
-        await add_quest_progress(p2_id, 'q_pvp_played', 1)
-        if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
-        if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
-
-        code_text_1 = ""
-        code_text_2 = ""
-        winner_user_id = None
-        
-        if "Draw" not in winner and "Ничья" not in winner:
-            if winner == p1_name: winner_user_id = p1_id
-            elif winner == p2_name: winner_user_id = p2_id
-            
-        if winner_user_id is not None:
-            if random.random() <= 0.04:
-                db = await get_db_connection()
-                try:
-                    async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                        row = await cursor.fetchone()
-                        if row:
-                            code_val = row['code']
-                            await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                            await db.commit()
-                            dropped_msg_ru = f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n"
-                            dropped_msg_en = f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                            if winner_user_id == p1_id:
-                                code_text_1 = loc(p1_lang, dropped_msg_ru, dropped_msg_en)
-                            else:
-                                code_text_2 = loc(p2_lang, dropped_msg_ru, dropped_msg_en)
-                except Exception as e:
-                    logging.error(f"Reward Code Drop PvP Error: {e}")
-                finally:
-                    await db.close()
-
-        final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-        final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-        
-        try: await msg1.edit_text(final1, reply_markup=None)
-        except: pass
-        try: await msg2.edit_text(final2, reply_markup=None)
-        except: pass
-        
-    finally:
-        active_combats.discard(p1_id)
-        active_combats.discard(p2_id)
 
 # ========================================================================
 # ТРЕЙДЫ
@@ -5108,21 +4822,37 @@ async def adm_bp_finish_and_save(callback: types.CallbackQuery, state: FSMContex
 @dp.callback_query(F.data == "adm_lb_main")
 async def adm_lb_main(callback: types.CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🥇 1 Место", callback_data="lb_edit_1")],
-        [InlineKeyboardButton(text="🥈 2 Место", callback_data="lb_edit_2")],
-        [InlineKeyboardButton(text="🥉 3 Место", callback_data="lb_edit_3")],
-        [InlineKeyboardButton(text="🏅 4-9 Места", callback_data="lb_edit_4_9")],
-        [InlineKeyboardButton(text="🎖 10-20 Места", callback_data="lb_edit_10_20")],
+        [InlineKeyboardButton(text="🏆 Кубки (Сезон)", callback_data="adm_lb_cat_trophies")],
+        [InlineKeyboardButton(text="💰 Шекели (Все время)", callback_data="adm_lb_cat_coins")],
+        [InlineKeyboardButton(text="🃏 Карты (Все время)", callback_data="adm_lb_cat_cards")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
-    await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите позицию для редактирования наград (выдаются каждые 2 дня):", reply_markup=kb)
+    await callback.message.edit_text("🏆 <b>Настройка наград за Лидерборд</b>\nВыберите категорию:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("adm_lb_cat_"))
+async def adm_lb_cat_select(callback: types.CallbackQuery, state: FSMContext):
+    cat = callback.data.split("_")[3]
+    await state.update_data(lb_current_type=cat)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🥇 1 Место", callback_data=f"lb_edit_1")],
+        [InlineKeyboardButton(text="🥈 2 Место", callback_data=f"lb_edit_2")],
+        [InlineKeyboardButton(text="🥉 3 Место", callback_data=f"lb_edit_3")],
+        [InlineKeyboardButton(text="🏅 4-9 Места", callback_data=f"lb_edit_4_9")],
+        [InlineKeyboardButton(text="🎖 10-20 Места", callback_data=f"lb_edit_10_20")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_lb_main")]
+    ])
+    cat_name = "Кубки" if cat == "trophies" else ("Шекели" if cat == "coins" else "Карты")
+    await callback.message.edit_text(f"🏆 <b>Настройка наград: {cat_name}</b>\nВыберите позицию для редактирования наград:", reply_markup=kb)
 
 @dp.callback_query(F.data.startswith("lb_edit_"))
 async def adm_lb_edit(callback: types.CallbackQuery, state: FSMContext):
     bracket = callback.data.replace("lb_edit_", "")
-    rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ?", (bracket,))
+    data = await state.get_data()
+    lb_type = data.get('lb_current_type', 'trophies')
     
-    text = f"🏆 <b>Награды для места: {bracket.replace('_', '-')}</b>\n\n"
+    rewards = await fetch_all("SELECT * FROM lb_rewards WHERE bracket = ? AND lb_type = ?", (bracket, lb_type))
+    
+    text = f"🏆 <b>Награды для места: {bracket.replace('_', '-')} ({lb_type})</b>\n\n"
     if not rewards:
         text += "<i>Награды не установлены.</i>\n"
     else:
@@ -5139,16 +4869,21 @@ async def adm_lb_edit(callback: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="➕ Добавить Шекели", callback_data=f"lb_add_sh_{bracket}")],
         [InlineKeyboardButton(text="➕ Добавить Карту", callback_data=f"lb_add_cd_{bracket}")],
         [InlineKeyboardButton(text="🗑 Очистить награды", callback_data=f"lb_clear_{bracket}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_lb_main")]
+        [InlineKeyboardButton(text="🔙 Назад", callback_data=f"adm_lb_cat_{lb_type}")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)
+    try: await callback.message.edit_text(text, reply_markup=kb)
+    except: pass
+    await callback.answer()
 
 @dp.callback_query(F.data.startswith("lb_clear_"))
-async def adm_lb_clear(callback: types.CallbackQuery):
+async def adm_lb_clear(callback: types.CallbackQuery, state: FSMContext):
     bracket = callback.data.replace("lb_clear_", "")
-    await execute_db("DELETE FROM lb_rewards WHERE bracket = ?", (bracket,))
+    data = await state.get_data()
+    lb_type = data.get('lb_current_type', 'trophies')
+    await execute_db("DELETE FROM lb_rewards WHERE bracket = ? AND lb_type = ?", (bracket, lb_type))
     await callback.answer("✅ Награды очищены!", show_alert=True)
-    await adm_lb_edit(callback, None)
+    fake_call = callback.model_copy(update={"data": f"lb_edit_{bracket}"})
+    await adm_lb_edit(fake_call, state)
 
 @dp.callback_query(F.data.startswith("lb_add_sh_"))
 async def adm_lb_add_shekels(callback: types.CallbackQuery, state: FSMContext):
@@ -5163,8 +4898,9 @@ async def adm_lb_save_shekels(message: types.Message, state: FSMContext):
     try:
         amt = int(message.text)
         data = await state.get_data()
-        await execute_db("INSERT INTO lb_rewards (bracket, reward_type, amount) VALUES (?, ?, ?)", (data['lb_bracket'], 'shekels', amt))
-        await message.answer(f"✅ Награда {amt} шекелей добавлена для {data['lb_bracket']} места!")
+        lb_type = data.get('lb_current_type', 'trophies')
+        await execute_db("INSERT INTO lb_rewards (bracket, reward_type, amount, lb_type) VALUES (?, ?, ?, ?)", (data['lb_bracket'], 'shekels', amt, lb_type))
+        await message.answer(f"✅ Награда {amt} шекелей добавлена для {data['lb_bracket']} места ({lb_type})!")
     except:
         await message.answer("❌ Число!")
     await state.clear()
@@ -5211,10 +4947,11 @@ async def adm_lb_mut_select(callback: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
     bracket = data['lb_bracket']
     card_id = data['lb_card_id']
+    lb_type = data.get('lb_current_type', 'trophies')
     
-    await execute_db("INSERT INTO lb_rewards (bracket, reward_type, card_id, mutation) VALUES (?, ?, ?, ?)", (bracket, 'card', card_id, mutation))
+    await execute_db("INSERT INTO lb_rewards (bracket, reward_type, card_id, mutation, lb_type) VALUES (?, ?, ?, ?, ?)", (bracket, 'card', card_id, mutation, lb_type))
     
-    await callback.message.edit_text(f"✅ Карта (ID {card_id}, Мутация: {mutation}) добавлена в награды для {bracket} места!")
+    await callback.message.edit_text(f"✅ Карта (ID {card_id}, Мутация: {mutation}) добавлена в награды для {bracket} места ({lb_type})!")
     await state.clear()
     await callback.answer()
 
@@ -5922,36 +5659,145 @@ async def cq_sp_edit_delete_pack(callback: types.CallbackQuery, pack_id: int):
 # МАСТЕРСКАЯ КРАФТА (CRAFTING SYSTEM)
 # ========================================================================
 
-async def get_card_sources(card_id: int) -> str:
-    sources = []
-    packs = await fetch_all("SELECT p.title FROM seed_pack_cards spc JOIN seed_packs p ON spc.pack_id = p.id WHERE spc.card_id = ?", (card_id,))
-    if packs: sources.append("📦 Сид-Паки: " + ", ".join([p['title'] for p in packs]))
-    
-    c = await fetch_one("SELECT drop_chance, rarity FROM cards WHERE id = ?", (card_id,))
-    if c:
-        if c['drop_chance'] > 0 and c['rarity'] != 'Leaderboard':
-            sources.append("🎲 Гача (/getcard) / Магазин")
-        if c['rarity'] == 'Leaderboard':
-            sources.append("🏆 Топ игроков (Лидерборд)")
-            
-    bps = await fetch_all("SELECT bp.title FROM bp_rewards bpr JOIN bp_levels bpl ON bpr.level_id = bpl.id JOIN battle_passes bp ON bpl.bp_id = bp.id WHERE bpr.card_id = ?", (card_id,))
-    if bps: sources.append("🎟 Батл-Пасс: " + ", ".join(list(set([b['title'] for b in bps]))))
-        
-    craft = await fetch_one("SELECT id FROM craft_recipes WHERE target_card_id = ?", (card_id,))
-    if craft: sources.append("🔨 Мастерская Крафта")
-    
-    if not sources: return "Невозможно получить (Эксклюзив)"
-    return "\n".join(f"  └ {s}" for s in sources)
-
 @dp.callback_query(F.data == "adm_craft_main")
 async def adm_craft_main(callback: types.CallbackQuery):
     if not await is_admin(callback.from_user.id): return
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Создать рецепт", callback_data="adm_craft_create")],
+        [InlineKeyboardButton(text="✏️ Изменить рецепт", callback_data="adm_craft_edit_list")],
         [InlineKeyboardButton(text="🗑 Удалить рецепт", callback_data="adm_craft_delete")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_main")]
     ])
     await callback.message.edit_text("🔨 <b>Управление Рецептами Крафта</b>\nЗдесь вы можете настраивать рецепты для создания карт.", reply_markup=kb)
+
+@dp.callback_query(F.data == "adm_craft_edit_list")
+async def adm_craft_edit_list(callback: types.CallbackQuery):
+    recipes = await fetch_all("SELECT r.id, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id")
+    if not recipes: return await callback.answer("Нет рецептов.", show_alert=True)
+    
+    kb = []
+    for r in recipes:
+        kb.append([InlineKeyboardButton(text=f"✏️ Изменить: {r['name']}", callback_data=f"adm_cr_ed_{r['id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Отмена", callback_data="adm_craft_main")])
+    await callback.message.edit_text("Выберите рецепт для изменения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data.startswith("adm_cr_ed_"))
+async def adm_craft_edit_menu(callback: types.CallbackQuery, state: FSMContext):
+    r_id = int(callback.data.split("_")[3])
+    await state.update_data(editing_recipe_id=r_id)
+    await show_craft_edit_menu(callback.message, state)
+    await callback.answer()
+
+async def show_craft_edit_menu(message_or_call, state: FSMContext):
+    data = await state.get_data()
+    r_id = data['editing_recipe_id']
+    recipe = await fetch_one("SELECT r.id, r.price, c.name FROM craft_recipes r JOIN cards c ON r.target_card_id = c.id WHERE r.id = ?", (r_id,))
+    ingredients = await fetch_all("SELECT i.id as ing_id, c.name, i.amount FROM craft_ingredients i JOIN cards c ON i.card_id = c.id WHERE i.recipe_id = ?", (r_id,))
+    
+    text = f"🔨 <b>Изменение рецепта: {recipe['name']}</b>\nЦена крафта: <b>{recipe['price']} 💰</b>\n\nИнгредиенты:\n"
+    if not ingredients: text += "<i>Пусто</i>\n"
+    else:
+        for idx, ing in enumerate(ingredients, 1):
+            text += f"{idx}. {ing['name']} x{ing['amount']}\n"
+            
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить цену", callback_data="cr_ed_price")],
+        [InlineKeyboardButton(text="➕ Добавить ингредиент", callback_data="cr_ed_add_ing")],
+        [InlineKeyboardButton(text="🗑 Удалить ингредиент", callback_data="cr_ed_del_ing")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="adm_craft_edit_list")]
+    ])
+    
+    if isinstance(message_or_call, types.Message):
+        await message_or_call.answer(text, reply_markup=kb)
+    else:
+        await message_or_call.edit_text(text, reply_markup=kb)
+    await state.set_state(AdminCraftEdit.menu)
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_price")
+async def cr_ed_price(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("Введите новую цену крафта в шекелях:")
+    await state.set_state(AdminCraftEdit.edit_price)
+    await callback.answer()
+
+@dp.message(AdminCraftEdit.edit_price)
+async def cr_ed_price_save(message: types.Message, state: FSMContext):
+    try:
+        price = int(message.text)
+        if price < 0: raise ValueError
+        data = await state.get_data()
+        r_id = data['editing_recipe_id']
+        await execute_db("UPDATE craft_recipes SET price = ? WHERE id = ?", (price, r_id))
+        await message.answer("✅ Цена обновлена!")
+        await show_craft_edit_menu(message, state)
+    except:
+        await message.answer("❌ Введите положительное число.")
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_add_ing")
+async def cr_ed_add_ing(callback: types.CallbackQuery, state: FSMContext):
+    all_cards = await fetch_all("SELECT id, name, rarity FROM cards ORDER BY id DESC")
+    items = [{"id": c['id'], "btn_text": f"{RARITY_EMOJI.get(c['rarity'], '⚪')} {c['name']} (ID:{c['id']})"} for c in all_cards]
+    await state.update_data(craft_items=items)
+    kb = get_pagination_keyboard(items, 0, "cred_ing", columns=1, items_per_page=8)
+    await callback.message.edit_text("Выберите карту-ингредиент для добавления:", reply_markup=kb)
+    await state.set_state(AdminCraftEdit.add_ing_card)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftEdit.add_ing_card, F.data.startswith("cred_ing_page_"))
+async def cr_ed_add_ing_pag(callback: types.CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[3])
+    data = await state.get_data()
+    kb = get_pagination_keyboard(data.get('craft_items', []), page, "cred_ing", columns=1, items_per_page=8)
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+@dp.callback_query(AdminCraftEdit.add_ing_card, F.data.startswith("cred_ing_"))
+async def cr_ed_add_ing_sel(callback: types.CallbackQuery, state: FSMContext):
+    if "page" in callback.data: return
+    card_id = int(callback.data.split("_")[2])
+    await state.update_data(cr_curr_ing=card_id)
+    await callback.message.edit_text("Введите количество требуемых штук (например: 5):")
+    await state.set_state(AdminCraftEdit.add_ing_amount)
+    await callback.answer()
+
+@dp.message(AdminCraftEdit.add_ing_amount)
+async def cr_ed_add_ing_amt(message: types.Message, state: FSMContext):
+    try:
+        amt = int(message.text)
+        if amt <= 0: raise ValueError
+        data = await state.get_data()
+        r_id = data['editing_recipe_id']
+        c_id = data['cr_curr_ing']
+        await execute_db("INSERT INTO craft_ingredients (recipe_id, card_id, amount) VALUES (?, ?, ?)", (r_id, c_id, amt))
+        await message.answer("✅ Ингредиент добавлен!")
+        await show_craft_edit_menu(message, state)
+    except:
+        await message.answer("❌ Число > 0.")
+
+@dp.callback_query(AdminCraftEdit.menu, F.data == "cr_ed_del_ing")
+async def cr_ed_del_ing(callback: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    r_id = data['editing_recipe_id']
+    ingredients = await fetch_all("SELECT i.id as ing_id, c.name, i.amount FROM craft_ingredients i JOIN cards c ON i.card_id = c.id WHERE i.recipe_id = ?", (r_id,))
+    if not ingredients: return await callback.answer("Нет ингредиентов для удаления.", show_alert=True)
+    
+    kb = []
+    for ing in ingredients:
+        kb.append([InlineKeyboardButton(text=f"🗑 {ing['name']} x{ing['amount']}", callback_data=f"cr_del_ing_{ing['ing_id']}")])
+    kb.append([InlineKeyboardButton(text="🔙 Назад", callback_data="cr_ed_back")])
+    await callback.message.edit_text("Выберите ингредиент для удаления:", reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("cr_del_ing_"))
+async def cr_del_ing_action(callback: types.CallbackQuery, state: FSMContext):
+    ing_id = int(callback.data.split("_")[3])
+    await execute_db("DELETE FROM craft_ingredients WHERE id = ?", (ing_id,))
+    await callback.answer("✅ Ингредиент удален!", show_alert=True)
+    await show_craft_edit_menu(callback.message, state)
+
+@dp.callback_query(F.data == "cr_ed_back")
+async def cr_ed_back(callback: types.CallbackQuery, state: FSMContext):
+    await show_craft_edit_menu(callback.message, state)
+    await callback.answer()
 
 @dp.callback_query(F.data == "adm_craft_delete")
 async def adm_craft_del_list(callback: types.CallbackQuery):
@@ -6092,7 +5938,7 @@ async def cmd_craft_menu(message: types.Message):
         [InlineKeyboardButton(text="📜 Рецепты", callback_data="craft_recipes_list")],
         [InlineKeyboardButton(text="✨ Улучшение мутаций", callback_data="craft_upgrade_list")]
     ])
-    await message.answer("🔨 **МАСТЕРСКАЯ КРАФТА**\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
+    await message.answer("🔨 <b>МАСТЕРСКАЯ КРАФТА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
 
 @dp.callback_query(F.data == "craft_menu_main")
 async def cb_craft_menu_main(callback: types.CallbackQuery):
@@ -6100,7 +5946,7 @@ async def cb_craft_menu_main(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="📜 Рецепты", callback_data="craft_recipes_list")],
         [InlineKeyboardButton(text="✨ Улучшение мутаций", callback_data="craft_upgrade_list")]
     ])
-    try: await callback.message.edit_text("🔨 **МАСТЕРСКАЯ КРАФТА**\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
+    try: await callback.message.edit_text("🔨 <b>МАСТЕРСКАЯ КРАФТА</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВыберите раздел:", reply_markup=kb)
     except: pass
     await callback.answer()
 
@@ -6112,7 +5958,7 @@ async def cb_craft_recipes_list(callback: types.CallbackQuery):
     items = [{"id": r['id'], "btn_text": f"🔨 {r['name']}"} for r in recipes]
     kb = get_pagination_keyboard(items, 0, "craft_rec", columns=1, items_per_page=8)
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="craft_menu_main")])
-    await callback.message.edit_text("📜 **Доступные Рецепты**:", reply_markup=kb)
+    await callback.message.edit_text("📜 <b>Доступные Рецепты</b>:", reply_markup=kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("craft_rec_page_"))
@@ -6310,13 +6156,7 @@ async def cb_cr_back_ui(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("cr_sel_page_"))
 async def cb_cr_sel_pag(callback: types.CallbackQuery):
-    page = int(callback.data.split("_")[3])
-    user_id = callback.from_user.id
-    if user_id not in active_crafts: return await callback.answer()
-    
-    # Just to get the ing_id from the first callback... this is slightly hacky but works for quick pag.
-    # Alternatively, we could store the current choosing ing_id in active_crafts.
-    pass # To keep it simple, pagination in sub-menus can be ignored if lists are small, but let's assume it works.
+    pass # Упрощенная пагинация для меню выбора, возвращаться назад кнопкой "Отмена"
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("cr_sel_"))
@@ -6354,26 +6194,35 @@ async def cb_craft_execute(callback: types.CallbackQuery):
         if ing['filled'] < ing['req']:
             return await callback.answer("❌ Ингредиенты не собраны!", show_alert=True)
             
+    # Агрегируем требуемое количество по каждому уникальному id в инвентаре (чтобы избежать конфликтов, если одна и та же копия выбрана для разных слотов-ингредиентов)
+    required_invs = {}
+    for ing in craft_data['ingredients'].values():
+        for inv_id, qty in ing['selected'].items():
+            required_invs[inv_id] = required_invs.get(inv_id, 0) + qty
+
     db = await get_db_connection()
     try:
         await db.execute("BEGIN")
-        # Validate and deduct
-        for ing in craft_data['ingredients'].values():
-            for inv_id, qty in ing['selected'].items():
-                cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
-                row = await cur.fetchone()
-                if not row or row['count'] < qty: raise Exception("Missing items")
+        # Валидация
+        for inv_id, qty in required_invs.items():
+            cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
+            row = await cur.fetchone()
+            if not row or row['count'] < qty: raise Exception("Missing items")
+            
+        # Списание
+        for inv_id, qty in required_invs.items():
+            cur = await db.execute("SELECT count FROM inventory WHERE id = ?", (inv_id,))
+            row = await cur.fetchone()
+            if row['count'] == qty:
+                await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
+                for s in ['equip1', 'equip2', 'equip3', 'equip4']:
+                    await db.execute(f"UPDATE users SET {s} = 0 WHERE id = ? AND {s} = ?", (user_id, inv_id))
+            else:
+                await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, inv_id))
                 
-                if row['count'] == qty:
-                    await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
-                    for s in ['equip1', 'equip2', 'equip3', 'equip4']:
-                        await db.execute(f"UPDATE users SET {s} = 0 WHERE {s} = ?", (inv_id,))
-                else:
-                    await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, inv_id))
-                    
         await db.execute("UPDATE users SET coins = coins - ? WHERE id = ?", (recipe['price'], user_id))
         
-        # Calculate mutation
+        # Вычисление мутации
         total_req = sum(i['req'] for i in craft_data['ingredients'].values())
         total_gold = 0
         total_rainbow = 0
@@ -6395,11 +6244,12 @@ async def cb_craft_execute(callback: types.CallbackQuery):
         await db.commit()
     except Exception as e:
         await db.execute("ROLLBACK")
-        return await callback.answer("❌ Ошибка при проверке предметов. Возможно, вы их обменяли.", show_alert=True)
+        logging.error(f"Craft Error: {e}")
+        return await callback.answer("❌ Ошибка при проверке предметов. Возможно, вы их обменяли или не хватает копий.", show_alert=True)
     finally:
         await db.close()
         
-    # Give target card
+    # Выдача целевой карты
     target_card = await fetch_one("SELECT * FROM cards WHERE id = ?", (recipe['target_card_id'],))
     _, serial, _ = await give_card_to_user(user_id, target_card['id'], result_mut, target_card['rarity'])
     
@@ -6547,13 +6397,13 @@ async def cb_crup_confirm(callback: types.CallbackQuery):
             if row['count'] == qty:
                 await db.execute("DELETE FROM inventory WHERE id = ?", (inv_id,))
                 for s in ['equip1', 'equip2', 'equip3', 'equip4']:
-                    await db.execute(f"UPDATE users SET {s} = 0 WHERE {s} = ?", (inv_id,))
+                    await db.execute(f"UPDATE users SET {s} = 0 WHERE id = ? AND {s} = ?", (user_id, inv_id))
             else:
                 await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (qty, inv_id))
         await db.commit()
     except Exception as e:
         await db.execute("ROLLBACK")
-        return await callback.answer("Ошибка слияния! Возможно, карты были удалены.", show_alert=True)
+        return await callback.answer("Ошибка слияния! Возможно, карты были удалены или использованы.", show_alert=True)
     finally:
         await db.close()
         
@@ -6571,402 +6421,6 @@ async def cb_crup_confirm(callback: types.CallbackQuery):
     text = f"🎉 <b>УЛУЧШЕНИЕ УСПЕШНО!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВы получили: {format_card_name(target_card)}\nНовая Мутация: <b>{mut_str}</b>\n\nКарта добавлена в инвентарь!"
     await callback.message.edit_text(text, reply_markup=None)
     await callback.answer()
-
-
-# ========================================================================
-# ПЕРЕОПРЕДЕЛЕНИЕ ФУНКЦИЙ БОЯ ДЛЯ ИСПРАВЛЕНИЯ БАГОВ
-# ========================================================================
-
-@dp.callback_query(F.data == "surrender_battle")
-async def cb_surrender_battle_fixed(callback: types.CallbackQuery):
-    if callback.from_user.id in active_combats:
-        surrendered_players.add(callback.from_user.id)
-        chat_id = callback.message.chat.id
-        if chat_id in active_manual_battles and active_manual_battles[chat_id]['p1_id'] == callback.from_user.id:
-            active_manual_battles[chat_id]['event'].set()
-        await callback.answer("🏳️ Вы сдались!", show_alert=True)
-    else:
-        await callback.answer("Вы не в бою!", show_alert=True)
-
-async def run_battle_loop(bot: Bot, chat_id: int, p1_id: int, p1_name: str, p2_id: int, p2_name: str, t1: list, t2: list, diff_trophies_scale: float = 1.0, diff_bp_mult: float = 1.0, is_pvp: bool = False, pvp_no_rewards: bool = False, lang="ru", mods=None):
-    try:
-        msg = await bot.send_message(chat_id, loc(lang, f"⚔️ Бой <b>{p1_name}</b> VS <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Battle <b>{p1_name}</b> VS <b>{p2_name}</b> starts in 3s!"))
-        await asyncio.sleep(1)
-        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 2 сек!", "⚔️ Battle starts in 2s!"))
-        except: pass
-        await asyncio.sleep(1)
-        try: await msg.edit_text(loc(lang, "⚔️ Бой начнется через 1 сек!", "⚔️ Battle starts in 1s!"))
-        except: pass
-        
-        battle_start_time = time.time()
-        log = []
-        apply_boosters(t1, p1_name, log, None, lang, lang)
-        apply_boosters(t2, p2_name, log, None, lang, lang)
-        
-        if log:
-            try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-            except Exception: pass
-            await battle_delay(p1_id, p2_id)
-
-        turn = 1
-        winner = None
-        winner_id = None
-        loser_id = None
-        p1_total_heals = 0
-        p2_total_heals = 0
-        timeout_flag = False
-        
-        while True:
-            if time.time() - battle_start_time > 180:
-                timeout_flag = True
-                break
-                
-            if p1_id in surrendered_players:
-                winner = p2_name; winner_id = p2_id; loser_id = p1_id
-                surrendered_players.discard(p1_id)
-                log.append(loc(lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                break
-
-            t1_alive = [c for c in t1 if c['hp'] > 0]
-            t2_alive = [c for c in t2 if c['hp'] > 0]
-            
-            if not t1_alive and not t2_alive:
-                winner = loc(lang, "Ничья", "Draw")
-                break
-            elif not t1_alive:
-                winner = p2_name
-                winner_id = p2_id
-                loser_id = p1_id
-                break
-            elif not t2_alive:
-                winner = p1_name
-                winner_id = p1_id
-                loser_id = p2_id
-                break
-                
-            if turn > 40:
-                winner = loc(lang, "Ничья по раундам", "Timeout Draw")
-                break
-
-            did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-            p1_total_heals += heals
-            if did_turn:
-                if len(log) > 6: log = log[-6:]
-                try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                except Exception as e:
-                    if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                await battle_delay(p1_id, p2_id)
-
-            if mods and mods.get('mod_enemy_atk_all') and not is_pvp:
-                t1_a = [c for c in t1 if c['hp']>0]
-                t2_a = [c for c in t2 if c['hp']>0]
-                if t1_a and t2_a:
-                    did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-                    p2_total_heals += heals_e
-                    if did_turn_e:
-                        if len(log) > 6: log = log[-6:]
-                        try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                        except Exception as e:
-                            if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                        await battle_delay(p1_id, p2_id)
-
-            t2_alive = [c for c in t2 if c['hp'] > 0]
-            if t2_alive:
-                if time.time() - battle_start_time > 180:
-                    timeout_flag = True
-                    break
-
-                did_turn_e, heals_e = await execute_turn(t2, t1, p2_name, p1_name, log, None, lang, lang)
-                p2_total_heals += heals_e
-                if did_turn_e:
-                    if len(log) > 6: log = log[-6:]
-                    try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                    except Exception as e:
-                        if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                    await battle_delay(p1_id, p2_id)
-                    
-                if mods and mods.get('mod_player_atk_all') and not is_pvp:
-                    t1_a = [c for c in t1 if c['hp']>0]
-                    t2_a = [c for c in t2 if c['hp']>0]
-                    if t1_a and t2_a:
-                        did_turn, heals = await do_player_turn_wrapper(chat_id, p1_id, p1_name, p2_name, t1, t2, log, lang, mods, is_pvp)
-                        p1_total_heals += heals
-                        if did_turn:
-                            if len(log) > 6: log = log[-6:]
-                            try: await msg.edit_text(build_battle_header(p1_name, t1, p2_name, t2, lang) + "\n".join(log), reply_markup=get_battle_kb(lang))
-                            except Exception as e:
-                                if "not found" in str(e).lower() or "deleted" in str(e).lower(): timeout_flag = True; break
-                            await battle_delay(p1_id, p2_id)
-            turn += 1
-
-        if timeout_flag:
-            try: await msg.edit_text(loc(lang, "⏳ <b>Бой автоматически прерван (ошибка или тайм-аут)!</b>", "⏳ <b>Battle automatically terminated (timeout/error)!</b>"))
-            except: pass
-            return
-
-        try:
-            if p1_total_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_total_heals)
-            
-            if is_pvp:
-                await add_quest_progress(p1_id, 'q_pvp_played', 1)
-                if p2_id != 0: 
-                    await add_quest_progress(p2_id, 'q_pvp_played', 1)
-                    if p2_total_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_total_heals)
-            else:
-                await add_quest_progress(p1_id, 'q_battles', 1)
-                if winner == p1_name: await add_quest_progress(p1_id, 'q_wins', 1)
-
-            code_text = ""
-            winner_user_id = None
-            if winner == p1_name: winner_user_id = p1_id
-            elif is_pvp and winner == p2_name: winner_user_id = p2_id
-
-            if winner_user_id is not None and "Draw" not in winner and "Ничья" not in winner:
-                if random.random() <= 0.04:
-                    db = await get_db_connection()
-                    try:
-                        async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                            row = await cursor.fetchone()
-                            if row:
-                                code_val = row['code']
-                                await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                                await db.commit()
-                                code_text = loc(lang,
-                                    f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n",
-                                    f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                                )
-                    except: pass
-                    finally: await db.close()
-
-            final_text = code_text + loc(lang, f"🏁 <b>ИТОГИ БОЯ: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Победитель: {winner}</b>\n\n", f"🏁 <b>BATTLE RESULTS: {p1_name} VS {p2_name}</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\n👑 <b>Winner: {winner}</b>\n\n")
-            bp_messages = []
-            
-            if pvp_no_rewards:
-                final_text += loc(lang, "🤝 <b>Дружеская дуэль завершена!</b> Награды и кубки не начислялись.", "🤝 <b>Friendly duel finished!</b> No rewards or trophies.")
-            elif is_pvp:
-                if "Draw" not in winner and "Ничья" not in winner and winner_id and loser_id:
-                    await execute_db("UPDATE users SET trophies = trophies + 15 WHERE id = ?", (winner_id,))
-                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 10) WHERE id = ?", (loser_id,))
-                    final_text += loc(lang, f"🏆 Победитель забирает <b>+15 Кубков</b>\n💀 Проигравший теряет <b>-10 Кубков</b>", f"🏆 Winner gets <b>+15 Trophies</b>\n💀 Loser loses <b>-10 Trophies</b>")
-            else:
-                mod_reward_mult = 1.0; mod_trophy_mult = 1.0
-                if mods:
-                    if mods.get('mod_enemy_hp'): mod_reward_mult += 0.3; mod_trophy_mult += 0.3
-                    if mods.get('mod_enemy_atk_all'): mod_reward_mult += 0.35; mod_trophy_mult += 0.35
-                    if mods.get('mod_enemy_stats'): mod_reward_mult += 0.2; mod_trophy_mult += 0.2
-                    if mods.get('mod_player_atk_all'): mod_reward_mult -= 0.4
-                    if mods.get('mod_manual_atk'): mod_reward_mult -= 0.5
-                    if mods.get('mod_player_hp'): mod_reward_mult -= 0.3
-                    
-                mod_reward_mult = max(0.1, mod_reward_mult)
-                coin_mult, xp_mult_event = await get_coin_xp_events()
-                
-                if winner == p1_name:
-                    user_data = await fetch_one("SELECT trophies FROM users WHERE id = ?", (p1_id,))
-                    user_trophies = user_data['trophies'] if user_data else 0
-                    rank = await get_user_rank(user_trophies)
-                    
-                    coins_base = random.randint(25, 90) * rank['reward_mult'] * diff_trophies_scale * 0.85 * coin_mult
-                    coins_won = int(coins_base * mod_reward_mult)
-                    won_t_base = await get_dynamic_trophies(rank['name'], rank['rank_idx'], diff_trophies_scale)
-                    won_t = int(won_t_base * mod_trophy_mult)
-                    
-                    await execute_db("UPDATE users SET coins = coins + ?, trophies = trophies + ? WHERE id = ?", (coins_won, won_t, p1_id))
-                    
-                    final_text += loc(lang, f"🎉 <b>Награды:</b>\n💰 {coins_won} Шекелей", f"🎉 <b>Rewards:</b>\n💰 {coins_won} Shekels")
-                    if coin_mult > 1.0: final_text += f" (Ивент x{coin_mult})"
-                    if mod_reward_mult != 1.0: final_text += f" [Моды x{mod_reward_mult:.2f}]"
-                    final_text += loc(lang, f"\n🏆 {won_t} Кубков\n", f"\n🏆 {won_t} Trophies\n")
-                    
-                    bp_xp = int((20 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-                    final_text += f"🎫 +{bp_xp} BP XP"
-                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-                    
-                elif winner == p2_name:
-                    await execute_db("UPDATE users SET trophies = MAX(0, trophies - 2) WHERE id = ?", (p1_id,))
-                    final_text += loc(lang, f"💀 Вы проиграли и потеряли <b>2 🏆</b>.\n", f"💀 You lost and dropped <b>2 🏆</b>.\n")
-                    bp_xp = int((5 * diff_bp_mult * xp_mult_event) * mod_reward_mult)
-                    lvl_up, bp_title, new_lvl = await add_bp_xp(p1_id, bp_xp)
-                    final_text += f"🎫 +{bp_xp} BP XP"
-                    if lvl_up: bp_messages.append(loc(lang, f"🎉 <b>НОВЫЙ УРОВЕНЬ БП!</b> {new_lvl} уровень в сезоне «{bp_title}»!", f"🎉 <b>NEW BP LEVEL!</b> Level {new_lvl} in '{bp_title}'!"))
-                    
-            try: await msg.edit_text(final_text, reply_markup=None)
-            except Exception: pass
-            
-            for b_msg in bp_messages:
-                try: await bot.send_message(p1_id, b_msg)
-                except: pass
-
-        except Exception as e:
-            logging.error(f"Reward error: {e}")
-            try: await msg.edit_text("Ошибка при выдаче наград.", reply_markup=None)
-            except: pass
-
-    finally:
-        active_combats.discard(p1_id)
-        if is_pvp and p2_id != 0: active_combats.discard(p2_id)
-        if chat_id in active_manual_battles: active_manual_battles.pop(chat_id, None)
-
-async def run_pvp_dual_broadcast(p1_id: int, p2_id: int, p1_name: str, p2_name: str, t1: list, t2: list):
-    try:
-        p1_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p1_id,)))['lang']
-        p2_lang = (await fetch_one("SELECT lang FROM users WHERE id=?", (p2_id,)))['lang']
-        
-        msg1 = await bot.send_message(p1_id, loc(p1_lang, f"⚔️ Дуэль против <b>{p2_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p2_name}</b> in 3s!"))
-        msg2 = await bot.send_message(p2_id, loc(p2_lang, f"⚔️ Дуэль против <b>{p1_name}</b> начнется через 3 сек!", f"⚔️ Duel vs <b>{p1_name}</b> in 3s!"))
-        await asyncio.sleep(1)
-        try: await msg1.edit_text("2...")
-        except: pass
-        try: await msg2.edit_text("2...")
-        except: pass
-        await asyncio.sleep(1)
-        try: await msg1.edit_text("1...")
-        except: pass
-        try: await msg2.edit_text("1...")
-        except: pass
-        await asyncio.sleep(1)
-        
-        battle_start_time = time.time()
-        log1 = []
-        log2 = []
-        apply_boosters(t1, p1_name, log1, log2, p1_lang, p2_lang)
-        apply_boosters(t2, p2_name, log1, log2, p1_lang, p2_lang)
-        
-        if log1:
-            header1 = build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1)
-            header2 = build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2)
-            try: await msg1.edit_text(header1, reply_markup=get_battle_kb(p1_lang))
-            except: pass
-            try: await msg2.edit_text(header2, reply_markup=get_battle_kb(p2_lang))
-            except: pass
-            await battle_delay(p1_id, p2_id)
-
-        turn = 1
-        winner = None
-        p1_heals = p2_heals = 0
-        timeout_flag = False
-        
-        while True:
-            if time.time() - battle_start_time > 180:
-                timeout_flag = True
-                break
-                
-            if p1_id in surrendered_players and p2_id in surrendered_players:
-                winner = "Draw"
-                surrendered_players.discard(p1_id); surrendered_players.discard(p2_id)
-                break
-            elif p1_id in surrendered_players:
-                winner = p2_name; surrendered_players.discard(p1_id)
-                log1.append(loc(p1_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                log2.append(loc(p2_lang, f"🏳️ <b>{p1_name} сдался!</b>", f"🏳️ <b>{p1_name} surrendered!</b>"))
-                break
-            elif p2_id in surrendered_players:
-                winner = p1_name
-                surrendered_players.discard(p2_id)
-                log1.append(loc(p1_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-                log2.append(loc(p2_lang, f"🏳️ <b>{p2_name} сдался!</b>", f"🏳️ <b>{p2_name} surrendered!</b>"))
-                break
-
-            t1_a = [c for c in t1 if c['hp'] > 0]
-            t2_a = [c for c in t2 if c['hp'] > 0]
-            if not t1_a and not t2_a: winner = "Draw"; break
-            elif not t1_a: winner = p2_name; break
-            elif not t2_a: winner = p1_name; break
-            if turn > 40: winner = "Timeout Draw"; break
-
-            did_turn, h = await execute_turn(t1, t2, p1_name, p2_name, log1, log2, p1_lang, p2_lang)
-            p1_heals += h
-            if did_turn:
-                if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-                try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
-                except Exception as e:
-                    if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                await battle_delay(p1_id, p2_id)
-
-            t2_a = [c for c in t2 if c['hp'] > 0]
-            if t2_a:
-                if time.time() - battle_start_time > 180:
-                    timeout_flag = True
-                    break
-                    
-                did_turn, h = await execute_turn(t2, t1, p2_name, p1_name, log1, log2, p1_lang, p2_lang)
-                p2_heals += h
-                if did_turn:
-                    if len(log1) > 6: log1 = log1[-6:]; log2 = log2[-6:]
-                    try: await msg1.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p1_lang) + "\n".join(log1), reply_markup=get_battle_kb(p1_lang))
-                    except Exception as e:
-                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                    try: await msg2.edit_text(build_battle_header(p1_name, t1, p2_name, t2, p2_lang) + "\n".join(log2), reply_markup=get_battle_kb(p2_lang))
-                    except Exception as e:
-                        if "message is not modified" not in str(e).lower() and ("not found" in str(e).lower() or "deleted" in str(e).lower()): timeout_flag=True; break
-                    await battle_delay(p1_id, p2_id)
-            turn += 1
-
-        if timeout_flag:
-            txt1 = loc(p1_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
-            txt2 = loc(p2_lang, "⏳ <b>Бой прерван (ошибка или тайм-аут).</b>", "⏳ <b>Battle terminated (timeout/error).</b>")
-            try: await msg1.edit_text(txt1)
-            except: pass
-            try: await msg2.edit_text(txt2)
-            except: pass
-            return
-
-        try:
-            await add_quest_progress(p1_id, 'q_pvp_played', 1)
-            await add_quest_progress(p2_id, 'q_pvp_played', 1)
-            if p1_heals > 0: await add_quest_progress(p1_id, 'q_heals_done', p1_heals)
-            if p2_heals > 0: await add_quest_progress(p2_id, 'q_heals_done', p2_heals)
-
-            code_text_1 = ""
-            code_text_2 = ""
-            winner_user_id = None
-            
-            if "Draw" not in winner and "Ничья" not in winner:
-                if winner == p1_name: winner_user_id = p1_id
-                elif winner == p2_name: winner_user_id = p2_id
-                
-            if winner_user_id is not None:
-                if random.random() <= 0.04:
-                    db = await get_db_connection()
-                    try:
-                        async with db.execute("SELECT code FROM reward_codes WHERE is_active = 1 AND owner_id = 0 ORDER BY RANDOM() LIMIT 1") as cursor:
-                            row = await cursor.fetchone()
-                            if row:
-                                code_val = row['code']
-                                await db.execute("UPDATE reward_codes SET owner_id = ? WHERE code = ?", (winner_user_id, code_val))
-                                await db.commit()
-                                dropped_msg_ru = f"🎁 <b>ВЫПАЛ УНИКАЛЬНЫЙ КОД-НАГРАДА!</b>\nНажми, чтобы скопировать: <code>{code_val}</code>\nАктивируй через /codereward\n\n"
-                                dropped_msg_en = f"🎁 <b>UNIQUE REWARD CODE DROPPED!</b>\nClick to copy: <code>{code_val}</code>\nActivate via /codereward\n\n"
-                                if winner_user_id == p1_id:
-                                    code_text_1 = loc(p1_lang, dropped_msg_ru, dropped_msg_en)
-                                else:
-                                    code_text_2 = loc(p2_lang, dropped_msg_ru, dropped_msg_en)
-                    except Exception as e:
-                        logging.error(f"Reward Code Drop PvP Error: {e}")
-                    finally:
-                        await db.close()
-
-            final1 = code_text_1 + loc(p1_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-            final2 = code_text_2 + loc(p2_lang, f"🏁 <b>ИТОГИ: {p1_name} VS {p2_name}</b>\nПобедитель: {winner}\nДружеская дуэль (без наград).", f"🏁 <b>RESULTS: {p1_name} VS {p2_name}</b>\nWinner: {winner}\nFriendly duel (no rewards).")
-            
-            try: await msg1.edit_text(final1, reply_markup=None)
-            except: pass
-            try: await msg2.edit_text(final2, reply_markup=None)
-            except: pass
-        except Exception as e:
-            logging.error(f"PVP Reward error: {e}")
-            try: await msg1.edit_text("Ошибка при выдаче наград.", reply_markup=None)
-            except: pass
-            try: await msg2.edit_text("Ошибка при выдаче наград.", reply_markup=None)
-            except: pass
-        
-    finally:
-        active_combats.discard(p1_id)
-        active_combats.discard(p2_id)
 
 async def main():
     await check_and_update_schema()
