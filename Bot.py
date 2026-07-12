@@ -31,7 +31,7 @@ import aiosqlite
 # ========================================================================
 # КОНФИГУРАЦИЯ БОТА
 # ========================================================================
-BOT_TOKEN = "8887633400:AAEvlERe0CN1twoc01jGxYzSi8f9Kbwck1A"
+BOT_TOKEN = "7725898870:AAGWJxQSpNOF1GDtw3XaNM93MzE6WJZrxms"
 SUPER_ADMIN_ID = 5341904332
 DB_NAME = "cards_database.db"
 
