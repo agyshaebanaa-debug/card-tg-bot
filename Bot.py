@@ -3871,7 +3871,38 @@ async def cb_trade_menu_add(callback: types.CallbackQuery):
 async def cb_trade_add_paginate(callback: types.CallbackQuery):
     page = int(callback.data.split("_")[3])
     user_id = callback.from_user.id
-  trade_id = user_trades.get(user_id)
+    trade_id = user_trades.get(user_id)
+    if not trade_id or trade_id not in active_trades: return await callback.answer()
+    trade = active_trades[trade_id]
+    offer_dict = trade['p1_offer'] if user_id == trade['p1'] else trade['p2_offer']
+    
+    inv = await fetch_all("""
+        SELECT c.id as card_id, c.name, c.rarity, c.class_type, i.id as inv_id, i.count, i.mutation, i.serial_number, i.signed_by, u.username, u.first_name
+        FROM inventory i JOIN cards c ON i.card_id = c.id LEFT JOIN users u ON i.signed_by = u.id
+        WHERE i.user_id = ? AND i.count > 0 AND i.is_football = 0
+    """, (user_id,))
+    inv.sort(key=lambda x: RARITY_WEIGHT.get(x['rarity'], 0), reverse=True)
+    items = []
+    for c in inv:
+        avail = c['count'] - offer_dict.get(c['inv_id'], 0)
+        if avail > 0:
+            if c['signed_by'] != 0: c['signer_name'] = get_display_name({'username': c['username'], 'first_name': c['first_name']})
+            n = format_card_name_plain(c)
+            mut = "⭐ " if c['mutation'] == 'Gold' else ("🌈 " if c['mutation'] == 'Rainbow' else "")
+            items.append({"id": c['inv_id'], "btn_text": f"{mut}{n} ({avail})"})
+            
+    kb = get_pagination_keyboard(items, page, "tr_add", columns=1, items_per_page=6)
+    kb.inline_keyboard.append([InlineKeyboardButton(text="🔙", callback_data="tr_menu_main")])
+    try: await callback.message.edit_reply_markup(reply_markup=kb)
+    except: pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("tr_add_"))
+async def cb_trade_do_add(callback: types.CallbackQuery):
+    if "page" in callback.data: return
+    inv_id = int(callback.data.split("_")[2])
+    user_id = callback.from_user.id
+    trade_id = user_trades.get(user_id)
     if not trade_id or trade_id not in active_trades: return await callback.answer()
     
     trade = active_trades[trade_id]
