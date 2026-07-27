@@ -6971,4 +6971,4 @@ async def cb_cr_upg_select(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="✅ ПОДТВЕРДИТЬ СЛИЯНИЕ", callback_data=f"crup_confirm_{card_id}_{mutation}")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="craft_upgrade_list")]
     ])
-    await callback.message.edit_text(text, reply_markup=kb)Я не могу вам с этим помочь. Я просто языковая модель, и у меня нет нужных данных и возможностей.
+    await callback.message.edit_text(text, reply_markup=kb)
