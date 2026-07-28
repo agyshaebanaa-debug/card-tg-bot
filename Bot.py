@@ -33,7 +33,7 @@ import aiosqlite
 # ========================================================================
 # КОНФИГУРАЦИЯ БОТА
 # ========================================================================
-BOT_TOKEN = "8953052039:AAEIYQI69yLHMRxLIUTVmmQvxxJlaJAw8hU"
+BOT_TOKEN = "8605624418:AAFkceAwqIo1F6aoaGZfyagOqdSHn83z-ww"
 SUPER_ADMIN_ID = 5341904332
 DB_NAME = "cards_database.db"
 
@@ -6972,3 +6972,112 @@ async def cb_cr_upg_select(callback: types.CallbackQuery):
         [InlineKeyboardButton(text="🔙 Назад", callback_data="craft_upgrade_list")]
     ])
     await callback.message.edit_text(text, reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("crup_confirm_"))
+async def cb_crup_confirm(callback: types.CallbackQuery):
+    parts = callback.data.split("_")
+    card_id = int(parts[2])
+    mutation = parts[3]
+    user_id = callback.from_user.id
+    
+    user = await fetch_one("SELECT vip_status FROM users WHERE id = ?", (user_id,))
+    needed_cards = 4 if (user and user.get('vip_status')) else 8
+    
+    to_mut = "Gold" if mutation == 'Normal' else "Rainbow"
+    
+    db = await get_db_connection()
+    try:
+        await db.execute("BEGIN EXCLUSIVE")
+        cur = await db.execute("SELECT SUM(count) as t FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND signed_by = 0", (user_id, card_id, mutation))
+        row = await cur.fetchone()
+        if not row or row['t'] is None or row['t'] < needed_cards:
+            raise ValueError("Not enough")
+            
+        needed = needed_cards
+        cur = await db.execute("SELECT id, count FROM inventory WHERE user_id = ? AND card_id = ? AND mutation = ? AND signed_by = 0 ORDER BY id ASC", (user_id, card_id, mutation))
+        packs = await cur.fetchall()
+        for pack in packs:
+            if needed <= 0: break
+            take = min(needed, pack['count'])
+            if take == pack['count']:
+                await db.execute("DELETE FROM inventory WHERE id = ?", (pack['id'],))
+                for s in ['equip1', 'equip2', 'equip3', 'equip4', 'equip5']:
+                    await db.execute(f"UPDATE users SET {s} = 0 WHERE id = ? AND {s} = ?", (user_id, pack['id']))
+            else:
+                await db.execute("UPDATE inventory SET count = count - ? WHERE id = ?", (take, pack['id']))
+            needed -= take
+        await db.commit()
+    except ValueError:
+        await db.execute("ROLLBACK")
+        return await callback.answer("Ошибка слияния! Не хватает карт.", show_alert=True)
+    except Exception as e:
+        await db.execute("ROLLBACK")
+        return await callback.answer("Системная ошибка.", show_alert=True)
+    finally:
+        await db.close()
+        
+    target_card = await fetch_one("SELECT * FROM cards WHERE id = ?", (card_id,))
+    _, serial, _ = await give_card_to_user(user_id, target_card['id'], to_mut, target_card['rarity'])
+    
+    target_card['mutation'] = to_mut
+    target_card['serial_number'] = serial
+    target_card['signed_by'] = 0
+    
+    await log_user_action(user_id, f"Улучшил {target_card['name']} до {to_mut}")
+    await add_quest_progress_new(user_id, 'q_upgrade', 1)
+    
+    mut_str = "🌈 Радужная" if to_mut == 'Rainbow' else "⭐ Золотая"
+    text = f"🎉 <b>УЛУЧШЕНИЕ УСПЕШНО!</b>\n━━━━━━━━━━━━━━━━━━━━━━━━\nВы получили: {format_card_name(target_card)}\nНовая Мутация: <b>{mut_str}</b>\n\nКарта добавлена в инвентарь!"
+    await callback.message.edit_text(text, reply_markup=None)
+    await callback.answer()
+
+
+# ========================================================================
+# ЗАПУСК БОТА И MAIN LOOP
+# ========================================================================
+async def main():
+    await check_and_update_schema()
+    
+    shop_exists = await fetch_all("SELECT * FROM shop_items")
+    if not shop_exists: await restock_shop()
+    
+    settings = await fetch_one("SELECT last_lb_reward, last_endless_lb_reward FROM server_settings WHERE id = 1")
+    if settings:
+        if settings.get('last_lb_reward', 0) == 0:
+            await execute_db("UPDATE server_settings SET last_lb_reward = ? WHERE id = 1", (time.time(),))
+        if settings.get('last_endless_lb_reward', 0) == 0:
+            await execute_db("UPDATE server_settings SET last_endless_lb_reward = ? WHERE id = 1", (time.time(),))
+            
+    asyncio.create_task(shop_auto_restock_task())
+    asyncio.create_task(leaderboard_rewards_task())
+    asyncio.create_task(trade_timeout_task())
+    asyncio.create_task(auto_backup_db())
+    
+    commands = [
+        BotCommand(command="start", description="Главное меню / Main Menu"),
+        BotCommand(command="donate", description="Донат магазин (R$)"),
+        BotCommand(command="updatelog", description="История обновлений / Updates"),
+        BotCommand(command="help", description="Огромное руководство / Guide"),
+        BotCommand(command="getcard", description="Выбить карту / Draw Card"),
+        BotCommand(command="shop", description="Магазин / Shop"),
+        BotCommand(command="inventory", description="Инвентарь / Inventory"),
+        BotCommand(command="equip", description="Экипировка колоды / Equip Deck"),
+        BotCommand(command="craft", description="Мастерская Крафта / Crafting"),
+        BotCommand(command="profile", description="Профиль и статы / Profile & Stats"),
+        BotCommand(command="trade", description="Обменяться картами / Trade Cards"),
+        BotCommand(command="quests", description="Квесты / Quests"),
+        BotCommand(command="index", description="Индекс всех карт / Card Index"),
+        BotCommand(command="top", description="Рейтинг игроков / Leaderboard"),
+        BotCommand(command="codereward", description="Активировать код / Redeem Code")
+    ]
+    await bot.set_my_commands(commands)
+    
+    logging.info("🤖 Карточный бот (с Endless Mode) успешно перезапущен!")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")
