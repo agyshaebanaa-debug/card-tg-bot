@@ -32,7 +32,7 @@ import aiosqlite
 # ========================================================================
 # КОНФИГУРАЦИЯ БОТА
 # ========================================================================
-BOT_TOKEN = "8924641990:AAFDstV6btEbDsa4_5lH7Ph0m1jT2eP-aNA"
+BOT_TOKEN = "8953052039:AAEIYQI69yLHMRxLIUTVmmQvxxJlaJAw8hU"
 SUPER_ADMIN_ID = 5341904332
 DB_NAME = "cards_database.db"
 
@@ -3205,11 +3205,11 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     user = await fetch_one("SELECT * FROM users WHERE id = ?", (callback.from_user.id,))
     
     diff_name = "Средний"
-    if diff_type == "easy": power_mult, trophies_scale, bp_xp_mult, diff_name = 0.7, 0.5, 0.8, "Лёгкий 🟢"
-    elif diff_type == "med": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.0, 1.0, 1.0, "Средний 🟡"
-    elif diff_type == "hard": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.5, 1.4, 1.2, "Сложный 🔴" 
-    elif diff_type == "nightmare": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.9, 1.8, 1.5, "Кошмар ☠️"
-    elif diff_type == "crazy": power_mult, trophies_scale, bp_xp_mult, diff_name = 2.5, 2.5, 2.0, "Crazy 🤯"
+    if diff_type == "easy": power_mult, trophies_scale, bp_xp_mult, diff_name = 0.8, 0.5, 0.8, "Лёгкий 🟢"
+    elif diff_type == "med": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.2, 1.0, 1.0, "Средний 🟡"
+    elif diff_type == "hard": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.8, 1.4, 1.2, "Сложный 🔴" 
+    elif diff_type == "nightmare": power_mult, trophies_scale, bp_xp_mult, diff_name = 2.4, 1.8, 1.5, "Кошмар ☠️"
+    elif diff_type == "crazy": power_mult, trophies_scale, bp_xp_mult, diff_name = 4, 2.5, 2.0, "Crazy 🤯"
         
     mods = {
         'mod_enemy_hp': user.get('mod_enemy_hp', 0),
