@@ -2537,7 +2537,7 @@ async def get_bot_team(user_id: int, difficulty_mult: float, rank_name: str, dif
         elif effective_rank == "Diamond": pool = by_rarity.get('Legendary', []) + by_rarity.get('Mythic', []) + (by_rarity.get('Super', []) if r < 0.1 else [])
         elif effective_rank == "Ruby": pool = by_rarity.get('Mythic', []) + by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + (by_rarity.get('Leaderboard', []) if r < 0.1 else [])
         elif effective_rank == "Uranium":
-            if diff_type in ["nightmare", "crazy"]: pool = by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + by_rarity.get('Leaderboard', [])
+            if diff_type in ["nightmare", "crazy"]: pool = by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + by_rarity.get('Secret', [])
             else: pool = by_rarity.get('Super', []) + by_rarity.get('Exclusive', []) + by_rarity.get('Mythic', []) + by_rarity.get('Leaderboard', [])
             if allow_secret: pool += by_rarity.get('Secret', [])
         
@@ -3209,7 +3209,7 @@ async def cmd_pve_battle(callback: types.CallbackQuery):
     elif diff_type == "med": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.2, 1.0, 1.0, "Средний 🟡"
     elif diff_type == "hard": power_mult, trophies_scale, bp_xp_mult, diff_name = 1.8, 1.4, 1.2, "Сложный 🔴" 
     elif diff_type == "nightmare": power_mult, trophies_scale, bp_xp_mult, diff_name = 2.4, 1.8, 1.5, "Кошмар ☠️"
-    elif diff_type == "crazy": power_mult, trophies_scale, bp_xp_mult, diff_name = 4, 2.5, 2.0, "Crazy 🤯"
+    elif diff_type == "crazy": power_mult, trophies_scale, bp_xp_mult, diff_name = 5, 2.5, 2.0, "Crazy 🤯"
         
     mods = {
         'mod_enemy_hp': user.get('mod_enemy_hp', 0),
